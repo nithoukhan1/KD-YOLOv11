@@ -1,0 +1,47 @@
+# YOLOv11-S Optimized SOTA
+nc: 9 
+scales: 
+  s: [0.50, 0.50, 1024] 
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]] 
+  - [-1, 1, Conv, [128, 3, 2]] 
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]] 
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]] 
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]] 
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]] 
+  - [-1, 2, C2PSA, [1024]] 
+
+head:
+  # --- Stage 1: Upsample to P4 (Medium Res) ---
+  - [-1, 1, DySample, [2, 'lp']] 
+  - [[-1, 6], 1, Concat, [1]] 
+  - [-1, 2, C3k2, [512, False]] 
+  # Optimized: ResEMA removed here to save memory/speed
+
+  # --- Stage 2: Upsample to P3 (High Res - 80x80) ---
+  - [-1, 1, DySample, [2, 'lp']] 
+  - [[-1, 4], 1, Concat, [1]] 
+  - [-1, 2, C3k2, [256, False]] 
+  # Optimized: ResEMA removed here (This was the main cause of 114 GFLOPs)
+
+  # --- Stage 3: Downsample to P4 ---
+  - [-1, 1, Conv, [256, 3, 2]] 
+  - [[-1, 13], 1, Concat, [1]]  # Note: 13 is the index of the first C3k2 above
+  - [-1, 2, C3k2, [512, False]] 
+  - [-1, 1, ResEMA, [8]]  # KEEP: Good trade-off for accuracy
+
+  # --- Stage 4: Downsample to P5 ---
+  - [-1, 1, Conv, [512, 3, 2]] 
+  - [[-1, 10], 1, Concat, [1]] 
+  - [-1, 2, C3k2, [1024, True]] 
+  - [-1, 1, ResEMA, [8]]  # KEEP: High semantic value, low cost
+
+  # --- Detect Head ---
+  # Indices shifted because we removed 2 layers. 
+  # Old: [18, 22, 26]. New: [16, 20, 24]
+  - [[16, 20, 24], 1, Detect, [nc]]

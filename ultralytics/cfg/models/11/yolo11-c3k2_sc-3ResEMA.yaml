@@ -1,0 +1,63 @@
+# YOLOv11 "All-Star" Medical Architecture (Exp F)
+# 1. Backbone: SCConv (Suppresses X-ray background)
+# 2. Neck: ResEMA (Focuses on lesion texture)
+# 3. Upsampling: DySample (Preserves fracture edges)
+
+nc: 9
+scales:
+  s: [0.50, 0.50, 1024]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  
+  # --- SCCONV REPLACEMENT 1 ---
+  # Replaces standard C3k2 with Spatial Reconstruction Block
+  - [-1, 2, C3k2_SC, [256, False, 0.25]] # 2
+  
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  
+  # --- SCCONV REPLACEMENT 2 ---
+  - [-1, 2, C3k2_SC, [512, False, 0.25]] # 4
+  
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  
+  # --- SCCONV REPLACEMENT 3 ---
+  - [-1, 2, C3k2_SC, [512, True]] # 6
+  
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  
+  # --- SCCONV REPLACEMENT 4 ---
+  - [-1, 2, C3k2_SC, [1024, True]] # 8
+  
+  - [-1, 1, SPPF, [1024, 5]] # 9
+  - [-1, 2, C2PSA, [1024]]   # 10
+
+head:
+  # --- NECK STAGE 1: Upsample P5 -> P4 ---
+  - [-1, 1, DySample, [2, 'lp']] # 11 (Replaces nn.Upsample)
+  - [[-1, 6], 1, Concat, [1]]    # 12 (Cat Backbone P4)
+  - [-1, 2, C3k2, [512, False]]  # 13
+  - [-1, 1, ResEMA, [512, 8]]    # 14 (INJECTION 1: Neck Attention)
+
+  # --- NECK STAGE 2: Upsample P4 -> P3 ---
+  - [-1, 1, DySample, [2, 'lp']] # 15 (Replaces nn.Upsample)
+  - [[-1, 4], 1, Concat, [1]]    # 16 (Cat Backbone P3)
+  - [-1, 2, C3k2, [256, False]]  # 17
+  - [-1, 2, C3k2, [256, False]] # 18 (Replaces ResEMA for P3 to test if attention is needed at this level)
+
+  # --- NECK STAGE 3: Downsample P3 -> P4 ---
+  - [-1, 1, Conv, [256, 3, 2]]   # 19
+  - [[-1, 14], 1, Concat, [1]]   # 20 (Cat Neck P4)
+  - [-1, 2, C3k2, [512, False]]  # 21
+  - [-1, 1, ResEMA, [512, 8]]    # 22 (INJECTION 3: Deep Attention)
+
+  # --- NECK STAGE 4: Downsample P4 -> P5 ---
+  - [-1, 1, Conv, [512, 3, 2]]   # 23
+  - [[-1, 10], 1, Concat, [1]]   # 24 (Cat Backbone P5)
+  - [-1, 2, C3k2, [1024, True]]  # 25
+  - [-1, 1, ResEMA, [1024, 8]]   # 26 (INJECTION 4: Deepest Attention)
+
+  # --- DETECT HEAD ---
+  - [[18, 22, 26], 1, Detect, [nc]] # Detect(P3, P4, P5)
