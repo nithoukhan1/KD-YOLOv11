@@ -2065,8 +2065,8 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
-    
-    
+
+
 class SPD(nn.Module):
     # Space-to-Depth layer for lossless downsampling
     def __init__(self, dimension=1):
@@ -2074,15 +2074,8 @@ class SPD(nn.Module):
         self.d = dimension
 
     def forward(self, x):
-        return torch.cat([
-            x[..., ::2, ::2],
-            x[..., 1::2, ::2],
-            x[..., ::2, 1::2],
-            x[..., 1::2, 1::2]
-        ], 1)
+        return torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
 
-
-import torch.nn.functional as F
 
 # 1. The Core Physics (SCConv)
 class SCConv(nn.Module):
@@ -2098,25 +2091,22 @@ class SCConv(nn.Module):
             nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(c),
         )
-        self.k4 = nn.Sequential(
-            nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c),
-            nn.ReLU()
-        )
+        self.k4 = nn.Sequential(nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False), nn.BatchNorm2d(c), nn.ReLU())
 
     def forward(self, x):
         identity = x
         # SRU Logic: Separate "Redundant" (Background) from "Informative" (Bone)
         q = self.k2(x)
-        
+
         # Interpolate back to original size to match identity
         if q.size()[-2:] != identity.size()[-2:]:
-            q = F.interpolate(q, size=identity.size()[-2:], mode='nearest')
-            
-        out = torch.sigmoid(torch.add(identity, q)) # Weighting map
-        out = torch.mul(self.k3(x), out) # Apply weights
-        out = self.k4(out) # Refine
+            q = F.interpolate(q, size=identity.size()[-2:], mode="nearest")
+
+        out = torch.sigmoid(torch.add(identity, q))  # Weighting map
+        out = torch.mul(self.k3(x), out)  # Apply weights
+        out = self.k4(out)  # Refine
         return out
+
 
 # 2. The YOLO Wrapper (C3k2_SC)
 class C3k2_SC(nn.Module):
@@ -2127,7 +2117,7 @@ class C3k2_SC(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)
-        
+
         # Replace standard Bottlenecks with SCConv blocks
         self.m = nn.Sequential(*(SCConv(c_) for _ in range(n)))
 
