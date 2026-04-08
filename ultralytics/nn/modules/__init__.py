@@ -16,11 +16,10 @@ Examples:
     >>> torch.onnx.export(m, x, f)
     >>> subprocess.run(f"onnxslim {f} {f} && open {f}", shell=True, check=True)  # pip install onnxslim
 """
-from .custom import DySample, ResEMA
+
 from .block import (
     C1,
     C2,
-    SPD,
     C2PSA,
     C3,
     C3TR,
@@ -28,6 +27,7 @@ from .block import (
     DFL,
     ELAN1,
     PSA,
+    SPD,
     SPP,
     SPPELAN,
     SPPF,
@@ -44,6 +44,7 @@ from .block import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2_SC,
     C3x,
     CBFuse,
     CBLinear,
@@ -60,7 +61,6 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
-    C3k2_SC,
 )
 from .conv import (
     CBAM,
@@ -78,6 +78,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
+from .custom import DySample, ResEMA
 from .head import (
     OBB,
     OBB26,
@@ -123,6 +124,7 @@ __all__ = (
     "OBB",
     "OBB26",
     "PSA",
+    "SPD",
     "SPP",
     "SPPELAN",
     "SPPF",
@@ -139,6 +141,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2_SC",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -154,6 +157,7 @@ __all__ = (
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
     "Detect",
+    "DySample",
     "Focus",
     "GhostBottleneck",
     "GhostConv",
@@ -175,6 +179,7 @@ __all__ = (
     "RepConv",
     "RepNCSPELAN4",
     "RepVGGDW",
+    "ResEMA",
     "ResNetLayer",
     "SCDown",
     "Segment",
@@ -189,8 +194,4 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
-    "DySample",
-    "ResEMA",
-    "SPD",
-    "C3k2_SC"
 )
