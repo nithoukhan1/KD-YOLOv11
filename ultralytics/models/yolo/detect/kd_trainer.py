@@ -22,29 +22,32 @@ class KDDetectionTrainer(DetectionTrainer):
         Logit-based Knowledge Distillation.
         """
         # 1. Calculate standard YOLO loss for the Student
+        # student_loss is a scalar for backprop; loss_items is a tensor [box, cls, dfl]
         student_loss, loss_items = super().loss(batch, preds)
         
         if self.teacher is None:
             return student_loss, loss_items
 
         # 2. Get predictions from the frozen Teacher model
+        # Ensure teacher is on the same device as the training batch
+        device = batch['img'].device
         with torch.no_grad():
-            # Ensure teacher and images are on the same device
-            device = next(self.model.parameters()).device
-            images = batch['img'].to(device)
-            teacher_preds = self.teacher(images)
+            teacher_preds = self.teacher(batch['img'].to(device))
             
         # 3. Calculate Distillation Loss (MSE between output logits)
-        # We iterate through the multi-scale prediction tensors (P3, P4, P5)
         kd_loss = 0.0
+        # Iterate through the multi-scale prediction tensors (P3, P4, P5)
         for s_pred, t_pred in zip(preds, teacher_preds):
             kd_loss += F.mse_loss(s_pred, t_pred.detach())
             
-        # 4. Combine standard detection loss with distillation loss
-        # Total Loss = L_Student + (alpha * L_KD)
-        total_loss = student_loss + (self.kd_weight * kd_loss)
+        # 4. Combine standard detection loss with weighted distillation loss
+        weighted_kd = self.kd_weight * kd_loss
+        total_loss = student_loss + weighted_kd
         
-        # Update loss items for logging
-        loss_items = total_loss.detach()
+        # 5. CRITICAL: Format loss_items for the progress bar
+        # We append the weighted KD loss to the existing [box, cls, dfl] tensor
+        # This makes it a tensor of size 4, matching your self.loss_names
+        kd_scalar = weighted_kd.detach().unsqueeze(0)
+        loss_items = torch.cat([loss_items, kd_scalar])
         
         return total_loss, loss_items
