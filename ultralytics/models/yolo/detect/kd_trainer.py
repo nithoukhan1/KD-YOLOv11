@@ -5,6 +5,8 @@ from.train import DetectionTrainer
 class KDDetectionTrainer(DetectionTrainer):
     def __init__(self, cfg=None, overrides=None, _callbacks=None, teacher_model=None):
         super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
+        # Add this line to show 'kd_loss' in the training table
+        self.loss_names = ['box_loss', 'cls_loss', 'dfl_loss', 'kd_loss']
         self.teacher = teacher_model
         self.kd_weight = 0.5  # Hyperparameter: influence of the teacher on the student
         
