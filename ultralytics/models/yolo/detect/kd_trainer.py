@@ -2,17 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from.train import DetectionTrainer
-from ultralytics.cfg import DEFAULT_CFG_DICT
 
-# 1. PERMANENT VALIDATION BYPASS
-# Adding these to global defaults ensures they are recognized by all DDP subprocesses
-if 'teacher_weights' not in DEFAULT_CFG_DICT:
-    DEFAULT_CFG_DICT['teacher_weights'] = None
-if 'kd_weight' not in DEFAULT_CFG_DICT:
-    DEFAULT_CFG_DICT['kd_weight'] = 0.5
-
-# 2. THE DISTILLATION ENGINE
-# This wrapper forces the model to calculate and return the 4th loss component
+# A wrapper that replaces the model's internal loss engine
 class DistillLossWrapper(nn.Module):
     def __init__(self, teacher, student_criterion, kd_weight):
         super().__init__()
@@ -21,26 +12,25 @@ class DistillLossWrapper(nn.Module):
         self.kd_weight = kd_weight
 
     def forward(self, preds, batch):
-        # A. Calculate standard Student YOLO losses [box, cls, dfl]
+        # 1. Calculate standard Student YOLO losses [box, cls, dfl]
         loss, loss_items = self.base(preds, batch)
         
-        # B. Get Teacher predictions (Soft Targets) on current GPU device
+        # 2. Get Teacher predictions (Soft Targets)
         device = batch['img'].device
-        if next(self.teacher.parameters()).device!= device:
-            self.teacher.to(device)
+        self.teacher.to(device)
         with torch.no_grad():
             teacher_preds = self.teacher(batch['img'])
             
-        # C. Calculate KD Loss (MSE alignment between raw scale logits)
+        # 3. Calculate KD Loss (MSE alignment between Student/Teacher raw logits)
         kd_loss = 0.0
         for s_logit, t_logit in zip(preds, teacher_preds):
             kd_loss += F.mse_loss(s_logit, t_logit.detach())
         weighted_kd = self.kd_weight * kd_loss
         
-        # D. Combine: Total Loss = Standard + (alpha * KD)
+        # 4. Combine: Total Loss = Standard + (alpha * KD)
         total_loss = loss + weighted_kd
         
-        # E. CRITICAL: Concatenate for logging so it reaches results.csv/console
+        # 5. CONCATENATE: Appending KD to the logging tensor [box, cls, dfl, kd]
         kd_val = weighted_kd.detach().view(1)
         loss_items = torch.cat([loss_items, kd_val])
         
@@ -48,39 +38,41 @@ class DistillLossWrapper(nn.Module):
 
 class KDDetectionTrainer(DetectionTrainer):
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
-        # custom_params logic is no longer needed thanks to Step 1
-        super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
+        # 1. Surgical Pop: Hide custom keys from the strict YOLO validator
+        custom_params = dict(overrides or {})
+        self.teacher_weights_path = custom_params.pop("teacher_weights", None)
+        self.kd_weight_val = float(custom_params.pop("kd_weight", 0.5))
+        super().__init__(cfg=cfg, overrides=custom_params, _callbacks=_callbacks)
         self.custom_loss_names = ['box_loss', 'cls_loss', 'dfl_loss', 'kd_loss']
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        """Build model and wrap its criterion before DDP initialization."""
+        """Build the model and wrap its criterion before training starts."""
         model = super().get_model(cfg, weights, verbose)
         
-        if self.args.teacher_weights:
+        if self.teacher_weights_path:
             from ultralytics import YOLO
-            if getattr(self, 'rank', -1) in (-1, 0):
-                print(f"🚀 Rank {getattr(self, 'rank', -1)}: Injecting Distillation into Model Criterion")
-            
-            # Load and freeze Teacher model separately in each GPU process
-            teacher_model = YOLO(self.args.teacher_weights).model
+            # Each GPU rank loads its own copy of the teacher
+            teacher_model = YOLO(self.teacher_weights_path).model
             teacher_model.eval()
             for param in teacher_model.parameters():
                 param.requires_grad = False
             
-            # DEEP INJECTION: Replace model criterion with our wrapper
-            model.criterion = DistillLossWrapper(teacher_model, model.criterion, float(self.args.kd_weight))
+            # DEEP INJECTION: Wrap the model's criterion directly
+            model.criterion = DistillLossWrapper(teacher_model, model.criterion, self.kd_weight_val)
+            if getattr(self, 'rank', -1) in (-1, 0):
+                print(f"🚀 Rank {getattr(self, 'rank', -1)}: Distillation Wrapper Injected into Model.")
             
         return model
 
-    def _setup_train(self, *args, **kwargs):
-        """Force average tracker to support 4 loss values across all ranks."""
-        super()._setup_train(*args, **kwargs)
+    def set_model_attributes(self):
+        """Force headers and trackers to support 4 values across all ranks."""
+        super().set_model_attributes()
         self.loss_names = self.custom_loss_names
-        # Re-initialize tloss tracker to size 4 to prevent Rank 0 truncation
+        # Re-initialize tloss to size 4 to prevent Rank 0 truncation
         self.tloss = torch.zeros(len(self.loss_names), device=self.device)
 
     def get_validator(self):
-        """Prevents Rank 0 header reset during evaluation phase."""
+        """Ensures custom loss names survive Rank 0 header resets."""
         validator = super().get_validator()
         self.loss_names = self.custom_loss_names
         return validator
