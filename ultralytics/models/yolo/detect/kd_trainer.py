@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from.train import DetectionTrainer
 
-# Wrapper to inject distillation into the model's internal loss engine
+# Wrapper to inject distillation logic directly into the model's forward pass
 class DistillLossWrapper(nn.Module):
     def __init__(self, teacher, student_criterion, kd_weight):
         super().__init__()
@@ -20,8 +20,9 @@ class DistillLossWrapper(nn.Module):
         with torch.no_grad():
             teacher_preds = self.teacher(batch['img'])
             
-        # 3. Calculate KD Loss (MSE alignment between Student/Teacher raw scale logits)
+        # 3. Calculate KD Loss (MSE alignment between Student/Teacher raw logits)
         kd_loss = 0.0
+        # Student raw outputs (preds) matched against teacher scale-wise targets
         for s_logit, t_logit in zip(preds, teacher_preds):
             kd_loss += F.mse_loss(s_logit, t_logit.detach())
         weighted_kd = self.kd_weight * kd_loss
@@ -30,7 +31,7 @@ class DistillLossWrapper(nn.Module):
         total_loss = loss + weighted_kd
         
         # 5. CONCATENATE: Appending KD to logging tensor [box, cls, dfl, kd]
-        # This fixes the "column shifting" by ensuring tensor size matches the header
+        # This fixes the "column shifting" by ensuring tensor size (4) matches the header
         kd_val = weighted_kd.detach().view(1)
         loss_items = torch.cat([loss_items, kd_val])
         
@@ -38,7 +39,7 @@ class DistillLossWrapper(nn.Module):
 
 class KDDetectionTrainer(DetectionTrainer):
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
-        # Surgical Pop: Bypass syntax error by hiding custom keys from strict validator
+        # Surgical Pop: Hide custom keys from strict validator to avoid SyntaxError
         custom_params = dict(overrides or {})
         self.teacher_weights_path = custom_params.pop("teacher_weights", None)
         self.kd_weight_val = float(custom_params.pop("kd_weight", 0.5))
@@ -52,7 +53,7 @@ class KDDetectionTrainer(DetectionTrainer):
         
         if self.teacher_weights_path:
             from ultralytics import YOLO
-            print(f"🚀 Injecting Distillation Wrapper into Model Criterion.")
+            print(f"🚀 Injecting order-aware Distillation Wrapper into Model Criterion.")
             
             # Load and freeze Teacher model
             teacher_model = YOLO(self.teacher_weights_path).model
@@ -60,13 +61,17 @@ class KDDetectionTrainer(DetectionTrainer):
             for param in teacher_model.parameters():
                 param.requires_grad = False
             
-            # Use getattr to safely handle DDP wrapping if it exists
+            # Use getattr to safely handle potential wrapping
             m = getattr(self.model, 'module', self.model)
             
-            # Replace model criterion with our wrapper
+            # MANUALLY INITIALIZE the default criterion (needs model.args which super() just attached)
+            if not hasattr(m, 'criterion') or m.criterion is None:
+                m.criterion = m.init_criterion()
+            
+            # WRAP the initialized criterion with our Distillation logic
             m.criterion = DistillLossWrapper(teacher_model, m.criterion, self.kd_weight_val)
 
-        # Force headers and trackers to support 4 values across all ranks
+        # Force headers and trackers to support 4 values
         self.loss_names = self.custom_loss_names
         # Re-initialize tloss to size 4 to prevent Rank 0 truncation/missing values
         self.tloss = torch.zeros(len(self.loss_names), device=self.device)
