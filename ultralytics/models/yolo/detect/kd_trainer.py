@@ -1,87 +1,64 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from.train import DetectionTrainer
-
-# Wrapper to inject distillation logic directly into the model's loss engine
-class DistillLossWrapper(nn.Module):
-    def __init__(self, teacher, student_criterion, kd_weight):
-        super().__init__()
-        self.teacher = teacher
-        self.base = student_criterion
-        self.kd_weight = kd_weight
-
-    def forward(self, preds, batch):
-        # 1. Calculate standard Student YOLO losses [box, cls, dfl]
-        loss, loss_items = self.base(preds, batch)
-        
-        # 2. Get Teacher predictions (Soft Targets)
-        # Ensure images match teacher precision (FP16 batch vs FP32 teacher)
-        dtype = next(self.teacher.parameters()).dtype
-        with torch.no_grad():
-            teacher_preds = self.teacher(batch['img'].to(dtype))
-            
-        # 3. Calculate KD Loss (MSE alignment between Student/Teacher scale-logits)
-        kd_loss = 0.0
-        for s_logit, t_logit in zip(preds, teacher_preds):
-            kd_loss += F.mse_loss(s_logit.to(torch.float32), t_logit.detach().to(torch.float32))
-        weighted_kd = self.kd_weight * kd_loss
-        
-        # 4. Combine: Total Loss = Standard + (alpha * KD)
-        total_loss = loss + weighted_kd
-        
-        # 5. CONCATENATE: Ensuring tensor size (4) matches header for proper logging
-        kd_val = weighted_kd.detach().view(1)
-        loss_items = torch.cat([loss_items, kd_val])
-        
-        return total_loss, loss_items
+from ultralytics.models.yolo.detect.train import DetectionTrainer
 
 class KDDetectionTrainer(DetectionTrainer):
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
-        self.custom_loss_names = ['box_loss', 'cls_loss', 'dfl_loss', 'kd_loss']
-        custom_params = dict(overrides or {})
-        self.teacher_weights_path = custom_params.pop("teacher_weights", None)
-        self.kd_weight_val = float(custom_params.pop("kd_weight", 0.5))
-        super().__init__(cfg=cfg, overrides=custom_params, _callbacks=_callbacks)
-
-    def set_model_attributes(self):
-        """DEEP INJECTION FIX: Manually build the model's brain before wrapping it."""
-        super().set_model_attributes() # Attaches args to trainer
+        super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
+        self.kd_weight = 0.5 # Adjust the weight of the distillation loss
         
-        if self.teacher_weights_path:
-            from ultralytics import YOLO
-            print(f"🚀 Rank {getattr(self, 'rank', -1)}: Injecting Distillation Wrapper.")
+        # 1. Initialize Teacher Model (MedSAM Image Encoder)
+        # Note: You will load the actual weights during the Kaggle training script
+        from segment_anything import sam_model_registry
+        self.teacher = sam_model_registry["vit_b"](checkpoint=overrides.get('teacher_weights', 'medsam_vit_b.pth'))
+        self.teacher = self.teacher.image_encoder
+        self.teacher.eval()
+        
+        # Freeze Teacher weights
+        for param in self.teacher.parameters():
+            param.requires_grad = False
             
-            # Load Expert Teacher
-            teacher_model = YOLO(self.teacher_weights_path).model
-            teacher_model.eval()
-            for param in teacher_model.parameters():
-                param.requires_grad = False
-            
-            # Use getattr to safely handle potential DDP rank wrapping
-            m = getattr(self.model, 'module', self.model)
-            
-            # CRITICAL: Attach hyperparameters and MANUALLY INITIALIZE the default criterion
-            m.args = self.args
-            m.criterion = m.init_criterion()
-            
-            # WRAP the initialized criterion with our Distillation logic
-            m.criterion = DistillLossWrapper(teacher_model, m.criterion, self.kd_weight_val)
+        self.student_features = None
 
-        # Force headers and trackers to support 4 values
-        self.loss_names = self.custom_loss_names
-        # Re-allocate memory buffer for the 4th value to prevent empty/zero logs
-        self.tloss = torch.zeros(len(self.loss_names), device=self.device)
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        model = super().get_model(cfg, weights, verbose)
+        
+        # 2. Register a forward hook to capture student feature maps
+        # The detect layer is typically the last layer in the model
+        detect_layer = model.model[-1] 
+        
+        def hook_fn(module, input, output):
+            # Input to the detect layer is a list of feature maps (P3, P4, P5)
+            self.student_features = input
+            
+        detect_layer.register_forward_pre_hook(hook_fn)
+        return model
 
-    def get_validator(self):
-        """Prevents Rank 0 header reset during validation steps."""
-        validator = super().get_validator()
-        self.loss_names = self.custom_loss_names
-        return validator
-
-    def label_loss_items(self, loss_items=None, prefix="train"):
-        """Ensure mapping dictionary is correctly formatted for results.csv."""
-        keys = [f"{prefix}/{name}" for name in self.custom_loss_names]
-        if loss_items is not None:
-            return dict(zip(keys, [round(float(x), 5) for x in loss_items]))
-        return keys
+    def criterion(self, preds, batch):
+        # 3. Calculate standard YOLO loss
+        loss, loss_items = super().criterion(preds, batch)
+        
+        # 4. Calculate Knowledge Distillation Loss
+        imgs = batch['img']
+        with torch.no_grad():
+            # MedSAM expects 1024x1024 inputs
+            teacher_features = self.teacher(imgs)
+            
+        # MedSAM outputs a 256-channel feature map
+        # We extract the corresponding student feature map (e.g., P3 which is 256 channels)
+        student_feat = self.student_features 
+        
+        # Resize teacher features to match student spatial dimensions if necessary
+        if teacher_features.shape[-2:]!= student_feat.shape[-2:]:
+            teacher_features = F.interpolate(teacher_features, size=student_feat.shape[-2:], mode='bilinear', align_corners=False)
+            
+        # Compute Mean Squared Error (MSE) between feature maps
+        kd_loss = F.mse_loss(student_feat, teacher_features)
+        
+        # Combine losses
+        total_loss = loss + (self.kd_weight * kd_loss)
+        
+        # Add KD loss to logging items for monitoring
+        loss_items = torch.cat((loss_items, kd_loss.unsqueeze(0)))
+        
+        return total_loss, loss_items
