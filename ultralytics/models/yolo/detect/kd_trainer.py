@@ -72,9 +72,19 @@ class KDModel(DetectionModel):
 
 # Custom Trainer that loads the KD Model
 class KDDetectionTrainer(DetectionTrainer):
+    def __init__(self, cfg=None, overrides=None, _callbacks=None):
+        if overrides is None:
+            overrides = {}
+        
+        # 1. Extract our custom argument to bypass YOLO's strict dictionary alignment
+        self.custom_teacher_weights = overrides.pop('teacher_weights', None)
+        
+        # 2. Initialize the standard YOLO trainer with the remaining official arguments
+        super().__init__(cfg, overrides, _callbacks)
+
     def get_model(self, cfg=None, weights=None, verbose=True):
-        teacher_weights = self.args.teacher_weights 
-        model = KDModel(cfg, ch=3, nc=self.data["nc"], verbose=verbose, teacher_weights=teacher_weights)
+        # 3. Pass the safely extracted weights into our KDModel
+        model = KDModel(cfg, ch=3, nc=self.data["nc"], verbose=verbose, teacher_weights=self.custom_teacher_weights)
         if weights:
             model.load(weights)
         return model
