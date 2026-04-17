@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.nn.tasks import DetectionModel
 from segment_anything import sam_model_registry
+from ultralytics.utils import DEFAULT_CFG
 
 class FeatureDistillLoss(nn.Module):
     def __init__(self, teacher_weights, base_criterion, student_model, alpha=0.5):
@@ -70,20 +71,24 @@ class KDModel(DetectionModel):
         self.criterion = FeatureDistillLoss(self.teacher_weights, base_criterion, self)
         return self.criterion
 
-# Custom Trainer that loads the KD Model
+# Update your Custom Trainer class
 class KDDetectionTrainer(DetectionTrainer):
-    def __init__(self, cfg=None, overrides=None, _callbacks=None):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         if overrides is None:
             overrides = {}
         
         # 1. Extract our custom argument to bypass YOLO's strict dictionary alignment
         self.custom_teacher_weights = overrides.pop('teacher_weights', None)
         
-        # 2. Initialize the standard YOLO trainer with the remaining official arguments
+        # 2. Safety check: ensure cfg is never None
+        if cfg is None:
+            cfg = DEFAULT_CFG
+            
+        # 3. Initialize the standard YOLO trainer with the remaining official arguments
         super().__init__(cfg, overrides, _callbacks)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        # 3. Pass the safely extracted weights into our KDModel
+        # Pass the safely extracted weights into our KDModel
         model = KDModel(cfg, ch=3, nc=self.data["nc"], verbose=verbose, teacher_weights=self.custom_teacher_weights)
         if weights:
             model.load(weights)
