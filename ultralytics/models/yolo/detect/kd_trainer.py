@@ -39,8 +39,11 @@ class FeatureDistillLoss(nn.Module):
         
         imgs = batch["img"]
         with torch.no_grad():
-            # Extract MedSAM embeddings
-            teacher_features = self.teacher(imgs)
+            # FIX: Dynamically cast the input images to match the MedSAM teacher's data type (float32)
+            teacher_imgs = imgs.to(next(self.teacher.parameters()).dtype)
+            
+            # Extract MedSAM embeddings using the casted images
+            teacher_features = self.teacher(teacher_imgs)
             
         s_feats = self.student_features
         kd_loss = 0.0
@@ -52,7 +55,9 @@ class FeatureDistillLoss(nn.Module):
             
             # Match channel dimensions by taking the minimum available channels
             min_c = min(s_feat.shape[1], t_feat_resized.shape[1])
-            kd_loss += F.mse_loss(s_feat[:, :min_c,...], t_feat_resized[:, :min_c,...])
+            
+            # Note: We must also ensure the resized teacher features match the student's AMP data type
+            kd_loss += F.mse_loss(s_feat[:, :min_c,...], t_feat_resized[:, :min_c,...].to(s_feat.dtype))
             
         kd_loss = kd_loss / len(s_feats)
         
