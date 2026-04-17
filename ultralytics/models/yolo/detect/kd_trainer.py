@@ -23,8 +23,11 @@ class FeatureDistillLoss(nn.Module):
         
         # 2. Register a forward hook to capture student feature maps
         self.student_features = None
-        def hook_fn(module, input, output):
-            # Input to the detection head is a list of features: [P3, P4, P5]
+        
+        # BUG FIX: forward_pre_hook only takes (module, input)
+        def hook_fn(module, input):
+            # In PyTorch, 'input' is passed to the hook as a tuple of arguments.
+            # The first argument (input) is the list of multi-scale feature maps: [P3, P4, P5]
             self.student_features = input 
             
         # Attach hook to the YOLO Detection Head
