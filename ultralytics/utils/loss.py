@@ -83,6 +83,44 @@ class FocalLoss(nn.Module):
             alpha_factor = label * self.alpha + (1 - label) * (1 - self.alpha)
             loss *= alpha_factor
         return loss.mean(1).sum()
+    
+    class DynamicAngularBCE(nn.Module):
+    """
+    Dynamic Angular Margin Loss adapted for YOLO Sigmoid BCE.
+    Enforces a stricter decision boundary specifically for rare medical classes.
+    """
+    def __init__(self, minority_classes=, margin=2.0, gamma=1.5):
+        super().__init__()
+        # Use standard PyTorch BCEWithLogitsLoss as the base for numerical stability
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.minority_classes = minority_classes
+        self.margin = margin
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        # Clone logits to safely apply the margin in-place without breaking gradients
+        modified_logits = logits.clone()
+        
+        # 1. Apply the Angular Margin Penalty
+        # By subtracting a margin from the true positive logits of minority classes, 
+        # we artificially decrease the model's confidence. This forces the optimizer 
+        # to push the weights further to achieve a low loss, creating a wider decision boundary.
+        for c in self.minority_classes:
+            mask = targets[..., c] > 0.5
+            modified_logits[..., c][mask] -= self.margin
+
+        # Calculate base BCE on the penalized logits
+        loss = self.bce(modified_logits, targets)
+
+        # 2. Apply Dynamic Weighting Factor
+        # Calculate the probability of the true class
+        pred_prob = logits.sigmoid()
+        p_t = targets * pred_prob + (1 - targets) * (1 - pred_prob)
+        
+        # Scale the loss dynamically based on sample difficulty
+        modulating_factor = (1.0 - p_t) ** self.gamma
+        
+        return loss * modulating_factor
 
 
 class DFLoss(nn.Module):
@@ -345,7 +383,8 @@ class v8DetectionLoss:
             print(f"✅ ACTIVATING FOCAL LOSS (Gamma={h.fl_gamma})")
             self.bce = FocalLoss(gamma=h.fl_gamma)
         else:
-            self.bce = nn.BCEWithLogitsLoss(reduction="none")
+            # Replaced standard BCE with our custom DAL formulation
+            self.bce = DynamicAngularBCE(minority_classes=, margin=2.0)
         # --- CUSTOM PATCH END ---
         self.hyp = h
         self.stride = m.stride  # model strides
