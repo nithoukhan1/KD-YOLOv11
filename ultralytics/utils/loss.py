@@ -85,10 +85,8 @@ class FocalLoss(nn.Module):
         return loss.mean(1).sum()
     
     class DynamicAngularBCE(nn.Module):
-    """
-    Dynamic Angular Margin Loss adapted for YOLO Sigmoid BCE.
-    Enforces a stricter decision boundary specifically for rare medical classes.
-    """
+        """Dynamic Angular Margin Loss adapted for YOLO Sigmoid BCE.
+        Enforces a stricter decision boundary specifically for rare medical classes."""
     def __init__(self, minority_classes=, margin=2.0, gamma=1.5):
         super().__init__()
         # Use standard PyTorch BCEWithLogitsLoss as the base for numerical stability
