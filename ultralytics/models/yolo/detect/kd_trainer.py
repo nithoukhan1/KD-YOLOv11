@@ -24,22 +24,20 @@ class FeatureDistillLoss(nn.Module):
         # 2. Register a forward hook to capture student feature maps
         self.student_features = None
         
-        # BUG FIX: forward_pre_hook only takes (module, input)
+        # Correct pre-hook signature (only takes module and input)
         def hook_fn(module, input):
-            # In PyTorch, 'input' is passed to the hook as a tuple of arguments.
-            # The first argument (input) is the list of multi-scale feature maps: [P3, P4, P5]
             self.student_features = input 
             
         # Attach hook to the YOLO Detection Head
         student_model.model[-1].register_forward_pre_hook(hook_fn)
 
-def forward(self, preds, batch):
+    def forward(self, preds, batch):
         # 3. Calculate standard YOLO loss (Box, Cls, DFL)
         loss, loss_items = self.base_criterion(preds, batch)
         
         imgs = batch["img"]
         with torch.no_grad():
-            # FIX: Dynamically cast the input images to match the MedSAM teacher's data type
+            # Dynamically cast the input images to match the MedSAM teacher's data type
             teacher_imgs = imgs.to(next(self.teacher.parameters()).dtype)
             
             # Extract MedSAM embeddings using the casted images
@@ -56,7 +54,7 @@ def forward(self, preds, batch):
             # Match channel dimensions by taking the minimum available channels
             min_c = min(s_feat.shape[1], t_feat_resized.shape[1])
             
-            # FIX: Ensure the resized teacher features match the student's AMP data type
+            # Ensure the resized teacher features match the student's AMP data type
             kd_loss += F.mse_loss(s_feat[:, :min_c,...], t_feat_resized[:, :min_c,...].to(s_feat.dtype))
             
         kd_loss = kd_loss / len(s_feats)
@@ -65,6 +63,7 @@ def forward(self, preds, batch):
         total_loss = loss + (self.alpha * kd_loss)
         
         return total_loss, loss_items
+
 
 # Custom Model that injects the KD Loss
 class KDModel(DetectionModel):
@@ -79,7 +78,8 @@ class KDModel(DetectionModel):
         self.criterion = FeatureDistillLoss(self.teacher_weights, base_criterion, self)
         return self.criterion
 
-# Update your Custom Trainer class
+
+# Custom Trainer that loads the KD Model
 class KDDetectionTrainer(DetectionTrainer):
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         if overrides is None:
