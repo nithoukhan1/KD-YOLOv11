@@ -14,6 +14,9 @@ class FeatureDistillLoss(nn.Module):
         self.teacher = self.teacher.image_encoder
         self.teacher.eval()
         
+        # FIX: Convert the massive teacher model to 16-bit half-precision to save VRAM
+        self.teacher.half() 
+        
         # Freeze Teacher weights
         for p in self.teacher.parameters():
             p.requires_grad = False
@@ -21,15 +24,13 @@ class FeatureDistillLoss(nn.Module):
         self.base_criterion = base_criterion
         self.alpha = alpha
         
-        # 2. Register a forward hook to capture student feature maps
         self.student_features = None
         
-        # Correct pre-hook signature (only takes module and input)
         def hook_fn(module, input):
             self.student_features = input 
             
-        # Attach hook to the YOLO Detection Head
         student_model.model[-1].register_forward_pre_hook(hook_fn)
+
 
     def forward(self, preds, batch):
         # 3. Calculate standard YOLO loss (Box, Cls, DFL)
