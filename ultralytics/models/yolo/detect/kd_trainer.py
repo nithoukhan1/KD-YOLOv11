@@ -36,8 +36,14 @@ class FeatureDistillLoss(nn.Module):
         loss, loss_items = self.base_criterion(preds, batch)
         
         imgs = batch["img"]
+        img_device = imgs.device # Get the specific GPU device of the current batch
+        
         with torch.no_grad():
-            # Dynamically cast the input images to match the MedSAM teacher's data type
+            # FIX 1: Ensure the teacher model is on the same GPU as the images
+            if next(self.teacher.parameters()).device!= img_device:
+                self.teacher.to(img_device)
+                
+            # FIX 2: Dynamically cast the input images to match the MedSAM teacher's data type
             teacher_imgs = imgs.to(next(self.teacher.parameters()).dtype)
             
             # Extract MedSAM embeddings using the casted images
