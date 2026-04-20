@@ -14,9 +14,6 @@ class FeatureDistillLoss(nn.Module):
         self.teacher = self.teacher.image_encoder
         self.teacher.eval()
         
-        # FIX: Convert the massive teacher model to 16-bit half-precision to save VRAM
-        self.teacher.half() 
-        
         # Freeze Teacher weights
         for p in self.teacher.parameters():
             p.requires_grad = False
@@ -24,31 +21,32 @@ class FeatureDistillLoss(nn.Module):
         self.base_criterion = base_criterion
         self.alpha = alpha
         
+        # 2. Register a forward hook to capture student feature maps
         self.student_features = None
         
         def hook_fn(module, input):
+            # FIX 1: PyTorch pre-hooks always receive a tuple. 
+            # We must extract index  to get the actual list of feature maps: [P3, P4, P5]
             self.student_features = input 
             
+        # Attach hook to the YOLO Detection Head
         student_model.model[-1].register_forward_pre_hook(hook_fn)
-
 
     def forward(self, preds, batch):
         # 3. Calculate standard YOLO loss (Box, Cls, DFL)
         loss, loss_items = self.base_criterion(preds, batch)
         
         imgs = batch["img"]
-        img_device = imgs.device # Get the specific GPU device of the current batch
         
-        with torch.no_grad():
-            # FIX 1: Ensure the teacher model is on the same GPU as the images
-            if next(self.teacher.parameters()).device!= img_device:
-                self.teacher.to(img_device)
-                
-            # FIX 2: Dynamically cast the input images to match the MedSAM teacher's data type
-            teacher_imgs = imgs.to(next(self.teacher.parameters()).dtype)
+        # FIX 2 & 3: Device mismatch and Precision/OOM handling
+        # This dynamically moves the teacher to the correct GPU and casts it to 16-bit (Half) 
+        # to match the AMP images, resolving the crash and saving massive amounts of VRAM.
+        if next(self.teacher.parameters()).device!= imgs.device or next(self.teacher.parameters()).dtype!= imgs.dtype:
+            self.teacher = self.teacher.to(device=imgs.device, dtype=imgs.dtype)
             
-            # Extract MedSAM embeddings using the casted images
-            teacher_features = self.teacher(teacher_imgs)
+        with torch.no_grad():
+            # Extract MedSAM embeddings
+            teacher_features = self.teacher(imgs)
             
         s_feats = self.student_features
         kd_loss = 0.0
@@ -61,8 +59,8 @@ class FeatureDistillLoss(nn.Module):
             # Match channel dimensions by taking the minimum available channels
             min_c = min(s_feat.shape[1], t_feat_resized.shape[1])
             
-            # Ensure the resized teacher features match the student's AMP data type
-            kd_loss += F.mse_loss(s_feat[:, :min_c,...], t_feat_resized[:, :min_c,...].to(s_feat.dtype))
+            # Both features are now safely in 16-bit on the same GPU
+            kd_loss += F.mse_loss(s_feat[:, :min_c,...], t_feat_resized[:, :min_c,...])
             
         kd_loss = kd_loss / len(s_feats)
         
@@ -92,18 +90,14 @@ class KDDetectionTrainer(DetectionTrainer):
         if overrides is None:
             overrides = {}
         
-        # 1. Extract our custom argument to bypass YOLO's strict dictionary alignment
         self.custom_teacher_weights = overrides.pop('teacher_weights', None)
         
-        # 2. Safety check: ensure cfg is never None
         if cfg is None:
             cfg = DEFAULT_CFG
             
-        # 3. Initialize the standard YOLO trainer with the remaining official arguments
         super().__init__(cfg, overrides, _callbacks)
 
     def get_model(self, cfg=None, weights=None, verbose=True):
-        # Pass the safely extracted weights into our KDModel
         model = KDModel(cfg, ch=3, nc=self.data["nc"], verbose=verbose, teacher_weights=self.custom_teacher_weights)
         if weights:
             model.load(weights)
