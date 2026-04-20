@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from __future__ import annotations
-import os
+
 import math
 from typing import Any
 
@@ -166,7 +166,7 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        
+
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
@@ -380,7 +380,7 @@ class v8DetectionLoss:
         m = model.model[-1]  # Detect() module
         
         # --- CUSTOM PATCH START ---
-        if hasattr(h, 'fl_gamma') and h.fl_gamma > 0.0:
+        if hasattr(h, "fl_gamma") and h.fl_gamma > 0.0:
             print(f"✅ ACTIVATING FOCAL LOSS (Gamma={h.fl_gamma})")
             self.bce = FocalLoss(gamma=h.fl_gamma)
         else:
