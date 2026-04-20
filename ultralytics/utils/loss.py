@@ -85,15 +85,17 @@ class FocalLoss(nn.Module):
         return loss.mean(1).sum()
     
     class DynamicAngularBCE(nn.Module):
-        """Dynamic Angular Margin Loss adapted for YOLO Sigmoid BCE.
-        Enforces a stricter decision boundary specifically for rare medical classes."""
-    def __init__(self, minority_classes=, margin=2.0, gamma=1.5):
-        super().__init__()
-        # Use standard PyTorch BCEWithLogitsLoss as the base for numerical stability
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
-        self.minority_classes = minority_classes
-        self.margin = margin
-        self.gamma = gamma
+        """
+        Dynamic Angular Margin Loss adapted for YOLO Sigmoid BCE.
+        Enforces a stricter decision boundary specifically for rare medical classes.
+        """
+        # FIX: Added the list  as the default value
+        def __init__(self, minority_classes=, margin=2.0, gamma=1.5):
+            super().__init__()
+            self.bce = nn.BCEWithLogitsLoss(reduction="none")
+            self.minority_classes = minority_classes
+            self.margin = margin
+            self.gamma = gamma
 
     def forward(self, logits, targets):
         # Clone logits to safely apply the margin in-place without breaking gradients
@@ -376,14 +378,16 @@ class v8DetectionLoss:
         h = model.args  # hyperparameters
 
         m = model.model[-1]  # Detect() module
+        
         # --- CUSTOM PATCH START ---
         if hasattr(h, 'fl_gamma') and h.fl_gamma > 0.0:
             print(f"✅ ACTIVATING FOCAL LOSS (Gamma={h.fl_gamma})")
             self.bce = FocalLoss(gamma=h.fl_gamma)
         else:
-            # Replaced standard BCE with our custom DAL formulation
+            # FIX: Added the list  here as well
             self.bce = DynamicAngularBCE(minority_classes=, margin=2.0)
         # --- CUSTOM PATCH END ---
+        
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
