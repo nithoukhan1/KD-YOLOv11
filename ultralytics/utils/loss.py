@@ -378,15 +378,7 @@ class v8DetectionLoss:
         h = model.args  # hyperparameters
 
         m = model.model[-1]  # Detect() module
-        
-        # --- CUSTOM PATCH START ---
-        if hasattr(self.hyp, 'fl_gamma') and self.hyp.fl_gamma > 0.0:
-            self.bce = FocalLoss(gamma=self.hyp.fl_gamma)
-        else:
-            # Replaced standard BCE with our custom DAL formulation
-            self.bce = DynamicAngularBCE(minority_classes=, margin=2.0)
-        # --- CUSTOM PATCH END ---
-        
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
@@ -395,6 +387,11 @@ class v8DetectionLoss:
         self.device = device
 
         self.use_dfl = m.reg_max > 1
+
+        # Class weights for handling imbalanced datasets
+        self.class_weights = getattr(model, "class_weights", None)
+        if self.class_weights is not None:
+            self.class_weights = self.class_weights.to(device).view(1, 1, -1)
 
         self.assigner = TaskAlignedAssigner(
             topk=tal_topk,
