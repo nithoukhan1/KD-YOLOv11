@@ -285,6 +285,6 @@ def train_kd(
         kd_alpha        = kd_alpha,
         kd_temperature  = kd_temperature,
     )
-    trainer = KDDetectionTrainer(overrides=overrides)
+    trainer = KDDetectionTrainer(cfg={}, overrides=overrides)
     trainer.train()
     return trainer
