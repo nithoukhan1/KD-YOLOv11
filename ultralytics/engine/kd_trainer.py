@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.utils import LOGGER, colorstr
-from ultralytics.utils.torch_utils import de_parallel
+from ultralytics.utils.torch_utils import unwrap_model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
