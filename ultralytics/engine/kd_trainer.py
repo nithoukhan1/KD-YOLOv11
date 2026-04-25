@@ -3,20 +3,24 @@ kd_trainer.py
 =============
 Knowledge Distillation trainer for YOLOv11-C3k2-SC-DySample-ResEMA.
 
-Place this file at:
-    KD-YOLOv11/ultralytics/engine/kd_trainer.py
+Place at:  KD-YOLOv11/ultralytics/engine/kd_trainer.py
 
-Teacher : YOLOv11L-C3k2-SC-DySample-ResEMA  (frozen, same custom arch)
+Teacher : YOLOv11L-C3k2-SC-DySample-ResEMA  (frozen)
 Student : YOLOv11S-C3k2-SC-DySample-ResEMA  (trainable — your model)
-KD Loss : Channel-Wise Distillation (CWD) at all 4 ResEMA neck outputs
+KD Loss : Channel-Wise Distillation (CWD) at ResEMA neck outputs
           YAML layer indices: 14, 18, 22, 26
 
-Fix log:
-    v1 — de_parallel → unwrap_model  (this repo removed de_parallel)
-    v2 — KD keys (teacher_weights, kd_alpha, kd_temperature) are popped
-         from the overrides dict BEFORE calling super().__init__() so that
-         Ultralytics check_dict_alignment() never sees them and does not
-         raise AttributeError: 'NoneType' object has no attribute 'keys'.
+Fix history:
+    v1 — de_parallel → unwrap_model  (this fork removed de_parallel)
+    v2 — KD keys popped from overrides before super().__init__()
+         (Ultralytics check_dict_alignment rejects unknown keys)
+    v3 — Root-cause fix for the NoneType crash:
+         super().__init__() must NOT be called with cfg=None explicitly.
+         BaseTrainer signature is __init__(self, cfg=DEFAULT_CFG, ...).
+         Passing cfg=None overrides that default, making get_cfg(None, ov)
+         pass None into check_dict_alignment as the base, which crashes.
+         Fix: only forward cfg when it is not None; otherwise let the
+         parent use its own DEFAULT_CFG default naturally.
 """
 
 import torch
@@ -36,16 +40,12 @@ class CWDLoss(nn.Module):
     """
     Channel-Wise Distillation loss.
 
-    For each channel, treats the H×W spatial map as a probability distribution
-    (softmax at temperature T) and minimises KL divergence between the teacher
-    and student distributions channel-by-channel.
+    Treats each feature channel's H×W map as a spatial probability distribution
+    (softmax at temperature T) and minimises KL divergence between teacher and
+    student distributions, channel by channel.
 
     Reference: Shu et al. "Channel-wise Knowledge Distillation for Dense
     Prediction", ICCV 2021.
-
-    Args:
-        temperature (float): Softmax temperature. Higher = softer targets.
-                             Recommended: 2.0 – 6.0. Default: 4.0.
     """
 
     def __init__(self, temperature: float = 4.0):
@@ -59,7 +59,7 @@ class CWDLoss(nn.Module):
     ) -> torch.Tensor:
         assert student.shape == teacher.shape, (
             f"CWD shape mismatch — student {student.shape} vs "
-            f"teacher {teacher.shape}. Check ChannelAdapter."
+            f"teacher {teacher.shape}. Check ChannelAdapter output."
         )
         B, C, H, W = student.shape
         s = F.softmax(student.view(B, C, -1) / self.T, dim=-1)
@@ -68,18 +68,18 @@ class CWDLoss(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Channel Adapter  —  1×1 conv aligning student → teacher channels
+# 2.  Channel Adapter  —  1×1 conv: student_ch → teacher_ch
 # ─────────────────────────────────────────────────────────────────────────────
 class ChannelAdapter(nn.Module):
     """
-    Lightweight 1×1 conv projecting student feature channels to match teacher.
-    Built lazily on first forward pass — no hard-coded channel numbers needed.
+    Lightweight 1×1 conv projecting student channels to match teacher channels
+    before CWD loss is computed. Built lazily from actual tensor shapes.
 
-    Expected channel sizes at your 4 hook points (S vs L scale):
-        Layer 14 : S=256  →  L=512   (adapter built automatically)
-        Layer 18 : S=128  →  L=256   (adapter built automatically)
-        Layer 22 : S=256  →  L=512   (adapter built automatically)
-        Layer 26 : S=512  →  L=512   (Identity — same channels)
+    Expected at your 4 hook points (S vs L scale):
+        Layer 14 : S=256 → L=512   (adapter built)
+        Layer 18 : S=128 → L=256   (adapter built)
+        Layer 22 : S=256 → L=512   (adapter built)
+        Layer 26 : S=512 → L=512   (Identity — same)
     """
 
     def __init__(self, in_ch: int, out_ch: int):
@@ -99,14 +99,7 @@ class ChannelAdapter(nn.Module):
 class FeatureCapture:
     """
     Attaches forward hooks to specific layer indices of a YOLO model and
-    stores their output tensors in self.features dict.
-
-    Usage:
-        capture = FeatureCapture(model, [14, 18, 22, 26])
-        _ = model(img)                  # forward fires hooks
-        feats = capture.features        # {14: tensor, 18: tensor, ...}
-        capture.clear()                 # reset between steps
-        capture.remove()                # detach all hooks when done
+    stores their output tensors. Call .clear() between steps, .remove() at end.
     """
 
     def __init__(self, model: nn.Module, layer_indices: list):
@@ -141,43 +134,49 @@ class FeatureCapture:
 # 4.  KD Detection Trainer
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ResEMA output layer indices in your neck YAML
-_KD_LAYERS = [14, 18, 22, 26]
+_KD_LAYERS = [14, 18, 22, 26]   # ResEMA outputs in your neck YAML
 
-# Keys that belong to KD only — must be stripped from overrides before
-# passing to super().__init__() so Ultralytics cfg validation doesn't crash.
+# KD keys that must NEVER reach Ultralytics cfg validation
 _KD_KEYS = ("teacher_weights", "kd_alpha", "kd_temperature")
 
 
 class KDDetectionTrainer(DetectionTrainer):
     """
-    Extends Ultralytics DetectionTrainer with CWD Knowledge Distillation.
+    Extends DetectionTrainer with CWD Knowledge Distillation.
 
-    Key design decision — KD keys are popped from `overrides` before
-    super().__init__() is called.  Ultralytics runs check_dict_alignment()
-    inside get_cfg() which rejects any key not in the default config schema.
-    Popping them first prevents the AttributeError crash.
+    Two-stage fix inside __init__:
+        1. Pop KD-specific keys from overrides so cfg validation never sees them.
+        2. Call super().__init__() WITHOUT cfg when cfg is None — letting the
+           parent use its own DEFAULT_CFG default, not None.
 
-    Extra keys for the overrides dict (consumed here, not forwarded):
-        teacher_weights  str    Path to teacher best.pt  (required)
-        kd_alpha         float  KD loss weight            (default 1.0)
-        kd_temperature   float  CWD temperature           (default 4.0)
+    Extra keys for the overrides dict (consumed here, stripped before super):
+        teacher_weights  str    Path to teacher best.pt   (required)
+        kd_alpha         float  KD loss weight             (default 1.0)
+        kd_temperature   float  CWD temperature            (default 4.0)
     """
 
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
-        # ── CRITICAL: pop KD-specific keys BEFORE super().__init__() ────────
-        # Ultralytics check_dict_alignment() raises AttributeError / ValueError
-        # if it encounters unknown keys.  We extract them here and store them
-        # as instance attributes; the parent never sees them.
-        ov = dict(overrides) if overrides else {}   # work on a copy
+
+        # ── FIX PART 1: strip KD keys before Ultralytics cfg validation ──────
+        # Work on a copy so we never mutate the caller's dict.
+        ov = dict(overrides) if overrides else {}
         self._kd_teacher_weights = ov.pop("teacher_weights", None)
         self._kd_alpha           = float(ov.pop("kd_alpha", 1.0))
         self._kd_temp            = float(ov.pop("kd_temperature", 4.0))
 
-        # Now it is safe to call parent — cleaned overrides only
-        super().__init__(cfg=cfg, overrides=ov, _callbacks=_callbacks)
+        # ── FIX PART 2: don't pass cfg=None explicitly ────────────────────────
+        # BaseTrainer.__init__ signature: __init__(self, cfg=DEFAULT_CFG, ...)
+        # Passing cfg=None explicitly overrides DEFAULT_CFG with None.
+        # get_cfg(None, overrides) then calls check_dict_alignment(None, ov)
+        # which crashes: AttributeError: 'NoneType' has no attribute 'keys'.
+        # Solution: only forward cfg when it is not None; otherwise call super
+        # without it so Python uses the default parameter value (DEFAULT_CFG).
+        if cfg is not None:
+            super().__init__(cfg=cfg, overrides=ov, _callbacks=_callbacks)
+        else:
+            super().__init__(overrides=ov, _callbacks=_callbacks)
 
-        # Runtime state — set up in setup_model()
+        # Runtime state — populated in setup_model()
         self.teacher      = None
         self._s_hooks     = None
         self._t_hooks     = None
@@ -188,13 +187,12 @@ class KDDetectionTrainer(DetectionTrainer):
 
     # ── A: Build student, then load teacher ──────────────────────────────────
     def setup_model(self):
-        """Called by BaseTrainer.train(). Builds student then injects KD."""
         super().setup_model()   # builds self.model (student)
 
         if not self._kd_teacher_weights:
             LOGGER.warning(
                 colorstr("KD WARNING: ") +
-                "teacher_weights not provided — KD loss is DISABLED."
+                "teacher_weights not provided — KD loss DISABLED."
             )
             return
 
@@ -206,10 +204,7 @@ class KDDetectionTrainer(DetectionTrainer):
     # ── B: Load and freeze teacher ────────────────────────────────────────────
     def _load_teacher(self):
         path = Path(self._kd_teacher_weights)
-        assert path.exists(), (
-            f"Teacher weights not found: {path}\n"
-            f"Check the teacher_weights= path."
-        )
+        assert path.exists(), f"Teacher weights not found: {path}"
         LOGGER.info(colorstr("KD: ") + f"Loading teacher from {path}")
 
         from ultralytics import YOLO
@@ -221,7 +216,6 @@ class KDDetectionTrainer(DetectionTrainer):
 
         device = next(self.model.parameters()).device
         self.teacher = self.teacher.to(device)
-
         LOGGER.info(
             colorstr("KD: ") +
             f"Teacher frozen on {device}.  "
@@ -233,7 +227,7 @@ class KDDetectionTrainer(DetectionTrainer):
         self._s_hooks = FeatureCapture(self.model,   _KD_LAYERS)
         self._t_hooks = FeatureCapture(self.teacher, _KD_LAYERS)
 
-    # ── D: Build channel adapters (lazy — from first forward shapes) ──────────
+    # ── D: Build channel adapters (lazy — from actual first-forward shapes) ───
     def _maybe_build_adapters(self, s_feats: dict, t_feats: dict):
         if self._adapters_ok:
             return
@@ -287,19 +281,15 @@ class KDDetectionTrainer(DetectionTrainer):
         trainer       = self
 
         def kd_loss_fn(batch, preds=None):
-            # 1. Standard detection loss (student forward → s_hooks fire)
+            # 1. Standard detection loss  (student forward → s_hooks fire)
             det_loss, det_items = original_loss(batch, preds)
-
-            # 2. Teacher forward, no grad (t_hooks fire)
+            # 2. Teacher forward, no grad  (t_hooks fire)
             with torch.no_grad():
                 trainer.teacher(batch["img"])
-
             # 3. CWD
             kd = trainer._compute_kd_loss()
-
             # 4. Combine
             total = det_loss + trainer._kd_alpha * kd
-
             # Periodic debug log
             trainer._kd_step += 1
             if trainer._kd_step % 50 == 0:
@@ -315,14 +305,14 @@ class KDDetectionTrainer(DetectionTrainer):
         raw_model.loss = kd_loss_fn
         LOGGER.info(colorstr("KD: ") + "Loss injection complete ✓")
 
-    # ── G: Keep teacher on correct GPU after DDP wrapping ─────────────────────
+    # ── G: Keep teacher on correct GPU after DDP ──────────────────────────────
     def _setup_ddp(self, world_size):
         super()._setup_ddp(world_size)
         if self.teacher is not None:
             device = next(self.model.parameters()).device
             self.teacher = self.teacher.to(device)
 
-    # ── H: Clean up hooks when training ends ──────────────────────────────────
+    # ── H: Clean up hooks at end ─────────────────────────────────────────────
     def final_eval(self):
         if self._s_hooks:
             self._s_hooks.remove()
@@ -332,7 +322,7 @@ class KDDetectionTrainer(DetectionTrainer):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Public entry-point — call this from your Kaggle notebook
+# 5.  Public entry-point — call from Kaggle notebook
 # ─────────────────────────────────────────────────────────────────────────────
 def train_kd(
     student_yaml:     str,
@@ -351,23 +341,8 @@ def train_kd(
     """
     Launch KD training from a Kaggle notebook.
 
-    Args:
-        student_yaml      Path to YOLOv11-C3k2-SC_DySample_ResEMA-S.yaml
-        teacher_weights   Path to trained YOLOv11L best.pt (frozen teacher)
-        data_yaml         Path to meta.yaml
-        epochs            Total training epochs            (default 150)
-        imgsz             Input image size                 (default 1024)
-        batch             Batch size — use 16 not 32.
-                          Teacher + student both hold activations in VRAM.
-        device            GPU devices string, e.g. '0,1'
-        kd_alpha          KD loss weight. Sweep: 0.5, 1.0, 2.0, 4.0
-        kd_temperature    CWD softmax temperature          (default 4.0)
-        project           Output project folder
-        name              Run sub-folder name
-        resume            Resume from last checkpoint?
-
-    Returns:
-        KDDetectionTrainer (training already complete).
+    Note: use batch=16 not 32 — teacher + student both hold activations in
+    VRAM during each forward pass. Each T4 has ~15 GB.
     """
     overrides = dict(
         model        = student_yaml,
@@ -386,13 +361,11 @@ def train_kd(
         project      = project,
         name         = name,
         resume       = resume,
-        # KD-specific keys — consumed by KDDetectionTrainer.__init__,
-        # popped from overrides before Ultralytics cfg validation runs.
+        # KD keys — popped inside KDDetectionTrainer.__init__ before super()
         teacher_weights = teacher_weights,
         kd_alpha        = kd_alpha,
         kd_temperature  = kd_temperature,
     )
-
     trainer = KDDetectionTrainer(overrides=overrides)
     trainer.train()
     return trainer
