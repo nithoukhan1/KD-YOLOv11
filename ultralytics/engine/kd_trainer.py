@@ -306,8 +306,9 @@ class KDDetectionTrainer(DetectionTrainer):
         LOGGER.info(colorstr("KD: ") + "Loss injection complete ✓")
 
     # ── G: Keep teacher on correct GPU after DDP ──────────────────────────────
-    def _setup_ddp(self, world_size):
-        super()._setup_ddp(world_size)
+    # CORRECT — matches this fork's signature (no world_size argument)
+    def _setup_ddp(self):
+        super()._setup_ddp()
         if self.teacher is not None:
             device = next(self.model.parameters()).device
             self.teacher = self.teacher.to(device)
