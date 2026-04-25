@@ -12,26 +12,13 @@ KD Loss : Channel-Wise Distillation (CWD) at ResEMA neck outputs
 
 Fix history:
     v1 — de_parallel → unwrap_model
-    v2 — Pop KD keys before super().__init__() (cfg validation crash)
+    v2 — Pop KD keys before super().__init__() (cfg trainer validation)
     v3 — Don't pass cfg=None to super (DEFAULT_CFG crash)
-    v4 — Remove world_size from _setup_ddp (DDP signature mismatch)
-    v5 — Save KD keys into self.args after super().__init__() so the
-         Ultralytics DDP subprocess can read them when it re-creates
-         the trainer. Also pop KD keys from cfg dict (DDP case) as
-         well as from overrides dict (normal case).
-
-HOW DDP BREAKS KD (the v5 root cause):
-    Ultralytics DDP spawns a subprocess using a temp Python file that
-    re-creates the trainer as:
-        cfg = DEFAULT_CFG_DICT.copy()
-        cfg.update(vars(trainer.args))       ← only keys in self.args survive
-        trainer = KDDetectionTrainer(cfg=cfg) ← overrides=None in subprocess
-    Because teacher_weights was popped from overrides and stored only as
-    self._kd_teacher_weights (not in self.args), the subprocess never saw
-    it and KD was silently disabled.
-    Fix: after super().__init__(), store KD params in self.args so they
-    appear in vars(trainer.args) and survive into the DDP subprocess.
-    Also: pop KD keys from cfg when cfg is a dict (DDP subprocess path).
+    v4 — Remove world_size from _setup_ddp (fork signature mismatch)
+    v5 — Save KD keys into self.args so DDP subprocess can read them
+    v6 — Override get_validator() to strip KD keys before validator's
+         get_cfg() runs check_dict_alignment(), then restore them.
+         Also use self.device (not model params) to place teacher on GPU.
 """
 
 import torch
@@ -42,6 +29,9 @@ from pathlib import Path
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.utils import LOGGER, colorstr
 from ultralytics.utils.torch_utils import unwrap_model
+
+# KD-specific keys that must be hidden from Ultralytics cfg validation
+_KD_KEYS = ("teacher_weights", "kd_alpha", "kd_temperature")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +63,7 @@ class CWDLoss(nn.Module):
 # 2.  Channel Adapter
 # ─────────────────────────────────────────────────────────────────────────────
 class ChannelAdapter(nn.Module):
-    """1×1 conv projecting student channels → teacher channels before CWD."""
+    """1×1 conv: student_ch → teacher_ch. Built lazily from actual shapes."""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
@@ -88,7 +78,7 @@ class ChannelAdapter(nn.Module):
 # 3.  Feature Capture (forward hooks)
 # ─────────────────────────────────────────────────────────────────────────────
 class FeatureCapture:
-    """Attaches forward hooks to specific layer indices, stores output tensors."""
+    """Attaches forward hooks to YOLO layer indices, stores output tensors."""
 
     def __init__(self, model: nn.Module, layer_indices: list):
         self.features: dict = {}
@@ -124,7 +114,18 @@ class KDDetectionTrainer(DetectionTrainer):
     """
     Extends DetectionTrainer with CWD Knowledge Distillation.
 
-    Extra overrides keys (handled here, stripped before Ultralytics sees them):
+    The fundamental DDP challenge:
+        Ultralytics DDP spawns a subprocess that rebuilds the trainer from
+        vars(self.args). Our KD params must live in self.args so they survive
+        into the subprocess. BUT self.args is also passed to the Validator,
+        which runs check_dict_alignment() and rejects unknown keys.
+
+    Solution:
+        - Store KD params in self.args (needed for DDP subprocess)
+        - Override get_validator() to strip KD params from self.args before
+          the Validator is created, then restore them immediately after.
+
+    Extra keys for the overrides dict:
         teacher_weights  str    Path to teacher best.pt   (required)
         kd_alpha         float  KD loss weight             (default 1.0)
         kd_temperature   float  CWD temperature            (default 4.0)
@@ -132,42 +133,33 @@ class KDDetectionTrainer(DetectionTrainer):
 
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
 
-        # ── Step 1: extract KD keys from overrides (normal training path) ────
+        # ── 1. Extract KD keys from overrides (normal call path) ─────────────
         ov = dict(overrides) if overrides else {}
         tw    = ov.pop("teacher_weights", None)
         alpha = float(ov.pop("kd_alpha", 1.0))
         temp  = float(ov.pop("kd_temperature", 4.0))
 
-        # ── Step 2: also extract from cfg when it is a dict (DDP subprocess) ─
-        # Ultralytics DDP re-creates the trainer as:
-        #     cfg = DEFAULT_CFG_DICT.copy(); cfg.update(vars(trainer.args))
-        #     trainer = KDDetectionTrainer(cfg=cfg)   # overrides=None
-        # So KD keys land in cfg dict, not in overrides.
+        # ── 2. Extract KD keys from cfg dict (DDP subprocess call path) ───────
+        # DDP rebuilds trainer as: KDDetectionTrainer(cfg=vars(self.args))
+        # where overrides=None, so KD params arrive via cfg dict.
         if isinstance(cfg, dict):
             tw    = cfg.pop("teacher_weights", tw)
             alpha = float(cfg.pop("kd_alpha", alpha))
             temp  = float(cfg.pop("kd_temperature", temp))
 
-        # Store before calling super so they're available in setup_model()
-        self._kd_teacher_weights = tw
-        self._kd_alpha           = alpha
-        self._kd_temp            = temp
-
-        # ── Step 3: call super WITHOUT cfg=None (would override DEFAULT_CFG) ─
+        # ── 3. Call super without cfg=None (would override DEFAULT_CFG) ───────
         if cfg is not None:
             super().__init__(cfg=cfg, overrides=ov, _callbacks=_callbacks)
         else:
             super().__init__(overrides=ov, _callbacks=_callbacks)
 
-        # ── Step 4: persist KD params into self.args ─────────────────────────
-        # self.args is a SimpleNamespace created by Ultralytics from the config.
-        # Ultralytics DDP reads vars(trainer.args) to build the subprocess cfg.
-        # Saving our params here means they survive into the DDP subprocess.
-        self.args.teacher_weights = self._kd_teacher_weights
-        self.args.kd_alpha        = self._kd_alpha
-        self.args.kd_temperature  = self._kd_temp
+        # ── 4. Save KD params into self.args so DDP subprocess sees them ──────
+        # self.args is a SimpleNamespace; vars(self.args) feeds the DDP file.
+        self.args.teacher_weights = tw
+        self.args.kd_alpha        = alpha
+        self.args.kd_temperature  = temp
 
-        # Runtime state
+        # Runtime state (populated in setup_model)
         self.teacher      = None
         self._s_hooks     = None
         self._t_hooks     = None
@@ -176,11 +168,38 @@ class KDDetectionTrainer(DetectionTrainer):
         self._cwd         = None
         self._kd_step     = 0
 
+    # ── get_validator: strip KD keys before Ultralytics cfg validation ────────
+    def get_validator(self):
+        """
+        Ultralytics passes self.args to DetectionValidator, which calls
+        get_cfg(overrides=args) → check_dict_alignment() → rejects our
+        custom keys with SyntaxError.
+
+        Fix: temporarily remove KD keys from self.args, create the validator
+        (which now sees a clean args namespace), then restore the keys so
+        DDP subprocess generation still works correctly.
+        """
+        # Save and remove KD keys
+        saved = {}
+        for key in _KD_KEYS:
+            if hasattr(self.args, key):
+                saved[key] = getattr(self.args, key)
+                delattr(self.args, key)
+
+        try:
+            validator = super().get_validator()
+        finally:
+            # Always restore — even if validator creation raises an exception
+            for key, val in saved.items():
+                setattr(self.args, key, val)
+
+        return validator
+
     # ── A: Build student, load teacher ───────────────────────────────────────
     def setup_model(self):
         super().setup_model()
 
-        # Read from self.args (always up-to-date, survives DDP)
+        # Read from self.args (always correct in both normal and DDP paths)
         teacher_weights = getattr(self.args, "teacher_weights", None)
         self._kd_alpha  = float(getattr(self.args, "kd_alpha", 1.0))
         self._kd_temp   = float(getattr(self.args, "kd_temperature", 4.0))
@@ -188,8 +207,7 @@ class KDDetectionTrainer(DetectionTrainer):
         if not teacher_weights:
             LOGGER.warning(
                 colorstr("KD WARNING: ") +
-                "teacher_weights not set — KD loss DISABLED. "
-                "Check that teacher_weights= was passed correctly."
+                "teacher_weights not set — KD loss DISABLED."
             )
             return
 
@@ -212,7 +230,9 @@ class KDDetectionTrainer(DetectionTrainer):
             p.requires_grad = False
         self.teacher.eval()
 
-        device = next(self.model.parameters()).device
+        # Use self.device (set by Ultralytics before setup_model is called)
+        # This ensures teacher goes to the correct GPU in DDP mode.
+        device = self.device
         self.teacher = self.teacher.to(device)
         LOGGER.info(
             colorstr("KD: ") +
@@ -225,11 +245,11 @@ class KDDetectionTrainer(DetectionTrainer):
         self._s_hooks = FeatureCapture(self.model,   _KD_LAYERS)
         self._t_hooks = FeatureCapture(self.teacher, _KD_LAYERS)
 
-    # ── D: Build channel adapters (lazy) ──────────────────────────────────────
+    # ── D: Build channel adapters (lazy, from first-forward shapes) ───────────
     def _maybe_build_adapters(self, s_feats: dict, t_feats: dict):
         if self._adapters_ok:
             return
-        device = next(self.model.parameters()).device
+        device = self.device
         for idx in _KD_LAYERS:
             sc = s_feats[idx].shape[1]
             tc = t_feats[idx].shape[1]
@@ -238,7 +258,7 @@ class KDDetectionTrainer(DetectionTrainer):
                 LOGGER.info(colorstr("KD adapter: ") + f"layer {idx}: {sc} ch — Identity")
             else:
                 self._adapters[idx] = ChannelAdapter(sc, tc).to(device)
-                LOGGER.info(colorstr("KD adapter: ") + f"layer {idx}: {sc}→{tc} ch — Conv built")
+                LOGGER.info(colorstr("KD adapter: ") + f"layer {idx}: {sc}→{tc} — Conv built")
         self._adapters_ok = True
 
     # ── E: Compute CWD ────────────────────────────────────────────────────────
@@ -247,7 +267,7 @@ class KDDetectionTrainer(DetectionTrainer):
         tf = self._t_hooks.features
         self._maybe_build_adapters(sf, tf)
 
-        device = next(self.model.parameters()).device
+        device = self.device
         kd = torch.tensor(0.0, device=device)
 
         for idx in _KD_LAYERS:
@@ -293,8 +313,7 @@ class KDDetectionTrainer(DetectionTrainer):
     def _setup_ddp(self):
         super()._setup_ddp()
         if self.teacher is not None:
-            device = next(self.model.parameters()).device
-            self.teacher = self.teacher.to(device)
+            self.teacher = self.teacher.to(self.device)
 
     # ── H: Clean up hooks ─────────────────────────────────────────────────────
     def final_eval(self):
@@ -324,7 +343,7 @@ def train_kd(
 ) -> KDDetectionTrainer:
     """
     Launch KD training from a Kaggle notebook.
-    batch=16 not 32 — teacher + student share GPU VRAM during forward.
+    batch=16 not 32 — teacher + student share GPU VRAM each forward pass.
     """
     overrides = dict(
         model        = student_yaml,
@@ -343,8 +362,9 @@ def train_kd(
         project      = project,
         name         = name,
         resume       = resume,
-        # KD keys — popped in __init__ before Ultralytics cfg validation,
-        # then saved to self.args so DDP subprocess can read them.
+        # KD keys — stripped from overrides in __init__ before Ultralytics
+        # cfg validation, saved to self.args for DDP, stripped again from
+        # self.args before validator creation in get_validator().
         teacher_weights = teacher_weights,
         kd_alpha        = kd_alpha,
         kd_temperature  = kd_temperature,
