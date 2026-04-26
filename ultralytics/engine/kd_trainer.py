@@ -17,14 +17,16 @@ Fix history:
     v6  — Override get_validator() to strip KD keys before validator check
     v7  — Remove debug logger (det_loss is 3-element tensor not scalar)
     v8  — Cast batch["img"] to teacher dtype (AMP FP16 vs FP32 teacher)
-    v9  — Override save_model() + _Hook as picklable class
-    v10 — Replace kd_loss_fn closure with _KDLossFn picklable class.
-          The EMA model retains a reference to model.loss, so even after
-          swapping raw_model.loss back to _original_loss the EMA copy
-          still held kd_loss_fn and caused pickle to fail.
-          Making _KDLossFn a top-level class (not a nested closure) makes
-          it fully picklable and eliminates the save_model crash entirely.
-          The save_model override is kept as a belt-and-suspenders safety.
+    v9  — Override save_model() to swap loss before/after pickling
+    v10 — _KDLossFn and _Hook as picklable top-level classes
+    v11 — Inject KD loss in _setup_train() AFTER super() creates EMA,
+          not in setup_model(). Root cause: _KDLossFn holds a reference
+          to the trainer, and deepcopy(model) for EMA creation tries to
+          copy the whole trainer including the dataloader iterator, which
+          raises NotImplementedError: _MultiProcessingDataLoaderIter
+          cannot be pickled. Moving injection after EMA is built avoids
+          the EMA ever seeing _KDLossFn, so deepcopy works cleanly.
+          save_model swap is kept as belt-and-suspenders for the EMA save.
 """
 
 import torch
@@ -84,13 +86,12 @@ class ChannelAdapter(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Hook callable — top-level class so pickle can serialise it
+# 3.  Hook callable — top-level picklable class
 # ─────────────────────────────────────────────────────────────────────────────
 class _Hook:
     """
     Picklable forward-hook callable.
-    Defined at module level (not as a nested closure) so torch.save
-    can pickle it without raising AttributeError.
+    Module-level class (not a nested closure) so torch.save can pickle it.
     """
 
     def __init__(self, store: dict, idx: int):
@@ -112,7 +113,9 @@ class FeatureCapture:
         self._hooks: list   = []
         raw = unwrap_model(model)
         for idx in layer_indices:
-            h = raw.model[idx].register_forward_hook(_Hook(self.features, idx))
+            h = raw.model[idx].register_forward_hook(
+                _Hook(self.features, idx)
+            )
             self._hooks.append(h)
         LOGGER.info(colorstr("KD hooks: ") +
                     f"attached at layers {layer_indices}")
@@ -127,21 +130,18 @@ class FeatureCapture:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  KD Loss callable — top-level class so pickle can serialise it
+# 5.  KD Loss callable — top-level picklable class
 # ─────────────────────────────────────────────────────────────────────────────
 class _KDLossFn:
     """
     Picklable replacement for model.loss that adds CWD distillation.
+    Module-level class — NOT a nested closure — so Python's pickle can
+    serialise it. Holds original_loss and trainer as instance attributes.
 
-    Defined at module level — NOT as a nested closure inside _inject_kd_loss.
-    This is the critical fix for v10: Python's pickle cannot serialise local
-    functions ('Can't get local object ...kd_loss_fn'), but it CAN serialise
-    instances of top-level classes.
-
-    Holds references to:
-        original_loss — the original DetectionModel.loss bound method
-        trainer       — the KDDetectionTrainer instance
-    Both are picklable.
+    IMPORTANT: This is only assigned to model.loss AFTER EMA is created
+    (inside _setup_train, after super()._setup_train()). This prevents
+    deepcopy(model) during EMA creation from trying to copy the trainer
+    and its unpicklable dataloader iterator.
     """
 
     def __init__(self, original_loss, trainer):
@@ -151,11 +151,11 @@ class _KDLossFn:
     def __call__(self, batch, preds=None):
         tr = self.trainer
 
-        # 1. Standard detection loss — student forward fires s_hooks
+        # 1. Standard detection loss (student forward → s_hooks fire)
         det_loss, det_items = self.original_loss(batch, preds)
 
-        # 2. Teacher forward, no grad — t_hooks fire
-        # FIX v8: cast image to teacher dtype (AMP sends FP16, teacher is FP32)
+        # 2. Teacher forward, no grad (t_hooks fire)
+        # FIX v8: cast image to teacher dtype — AMP sends FP16, teacher is FP32
         with torch.no_grad():
             teacher_dtype = next(tr.teacher.parameters()).dtype
             teacher_img   = batch["img"].to(dtype=teacher_dtype)
@@ -176,7 +176,15 @@ class KDDetectionTrainer(DetectionTrainer):
     """
     Extends DetectionTrainer with CWD Knowledge Distillation.
 
-    Extra keys for overrides dict (consumed here, never forwarded):
+    Key design — injection order:
+        setup_model()   → loads student + teacher, attaches hooks, builds CWD
+                          does NOT inject kd_loss_fn yet
+        _setup_train()  → calls super() which builds EMA from model with
+                          ORIGINAL loss (so deepcopy works cleanly)
+                          THEN injects _KDLossFn into model.loss
+                          From this point forward every forward pass uses KD
+
+    Extra overrides keys (consumed here, never forwarded):
         teacher_weights  str    Path to teacher best.pt   (required)
         kd_alpha         float  KD loss weight             (default 1.0)
         kd_temperature   float  CWD temperature            (default 4.0)
@@ -184,7 +192,7 @@ class KDDetectionTrainer(DetectionTrainer):
 
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
 
-        # FIX v2: pop KD keys from overrides before cfg validation
+        # FIX v2: pop KD keys before cfg validation
         ov    = dict(overrides) if overrides else {}
         tw    = ov.pop("teacher_weights", None)
         alpha = float(ov.pop("kd_alpha", 1.0))
@@ -215,8 +223,9 @@ class KDDetectionTrainer(DetectionTrainer):
         self._adapters_ok   = False
         self._cwd           = None
         self._original_loss = None
+        self._kd_ready      = False   # True after _setup_train injects KD
 
-    # ── FIX v6: strip KD keys before Validator's cfg check ───────────────────
+    # ── FIX v6: strip KD keys before Validator cfg check ─────────────────────
     def get_validator(self):
         saved = {}
         for key in _KD_KEYS:
@@ -230,32 +239,14 @@ class KDDetectionTrainer(DetectionTrainer):
                 setattr(self.args, key, val)
         return validator
 
-    # ── FIX v9/v10: restore original loss before saving ───────────────────────
-    def save_model(self):
-        """
-        Belt-and-suspenders: restore model.loss to original before pickling,
-        re-inject after. With _KDLossFn now picklable this may not be strictly
-        needed, but it's kept to avoid any edge-case reference issues.
-        """
-        raw        = unwrap_model(self.model)
-        kd_loss_fn = raw.loss if self._original_loss is not None else None
-
-        if kd_loss_fn is not None:
-            raw.loss = self._original_loss
-
-        try:
-            super().save_model()
-        finally:
-            if kd_loss_fn is not None:
-                raw.loss = kd_loss_fn
-
-    # ── A: Build student, load teacher ───────────────────────────────────────
+    # ── A: Build student and load teacher, attach hooks, build CWD ───────────
+    #       Does NOT inject model.loss — that happens after EMA is created.
     def setup_model(self):
-        super().setup_model()
+        super().setup_model()   # builds self.model (student)
 
         teacher_weights  = getattr(self.args, "teacher_weights", None)
-        self._kd_alpha   = float(getattr(self.args, "kd_alpha",        1.0))
-        self._kd_temp    = float(getattr(self.args, "kd_temperature",  4.0))
+        self._kd_alpha   = float(getattr(self.args, "kd_alpha",       1.0))
+        self._kd_temp    = float(getattr(self.args, "kd_temperature", 4.0))
 
         if not teacher_weights:
             LOGGER.warning(colorstr("KD WARNING: ") +
@@ -266,7 +257,21 @@ class KDDetectionTrainer(DetectionTrainer):
         self._load_teacher()
         self._attach_hooks()
         self._cwd = CWDLoss(temperature=self._kd_temp)
-        self._inject_kd_loss()
+        # NOTE: _inject_kd_loss() is called from _setup_train(), not here.
+
+    # ── FIX v11: _setup_train injects KD AFTER EMA is created ────────────────
+    def _setup_train(self):
+        """
+        super()._setup_train() creates the EMA via deepcopy(model).
+        At that point model.loss is still the original — deepcopy works.
+        We inject _KDLossFn immediately after, so all training steps use KD.
+        """
+        super()._setup_train()
+
+        # Only inject if teacher was successfully loaded
+        if self.teacher is not None and not self._kd_ready:
+            self._inject_kd_loss()
+            self._kd_ready = True
 
     # ── B: Load and freeze teacher ────────────────────────────────────────────
     def _load_teacher(self):
@@ -322,7 +327,7 @@ class KDDetectionTrainer(DetectionTrainer):
             if s.shape[-2:] != t.shape[-2:]:
                 s = F.interpolate(s, size=t.shape[-2:],
                                   mode="bilinear", align_corners=False)
-            # FIX v8: cast to float32 — AMP may produce FP16 features
+            # FIX v8: cast to float32 — AMP may give FP16 features
             s = self._adapters[idx](s.float())
             t = t.float()
             kd = kd + self._cwd(s, t)
@@ -331,17 +336,26 @@ class KDDetectionTrainer(DetectionTrainer):
         self._t_hooks.clear()
         return kd / len(_KD_LAYERS)
 
-    # ── F: Inject KD loss ─────────────────────────────────────────────────────
+    # ── F: Inject KD loss (called from _setup_train after EMA is built) ───────
     def _inject_kd_loss(self):
         raw_model = unwrap_model(self.model)
-
-        # Save original so save_model() can restore it for pickling
         self._original_loss = raw_model.loss
-
-        # FIX v10: use picklable _KDLossFn class, NOT a local closure
+        # FIX v10: picklable class, not a local closure
         raw_model.loss = _KDLossFn(self._original_loss, self)
-
         LOGGER.info(colorstr("KD: ") + "Loss injection complete ✓")
+
+    # ── FIX v9: restore original loss before save, re-inject after ────────────
+    def save_model(self):
+        raw        = unwrap_model(self.model)
+        kd_loss_fn = raw.loss if self._original_loss is not None else None
+
+        if kd_loss_fn is not None:
+            raw.loss = self._original_loss
+        try:
+            super().save_model()
+        finally:
+            if kd_loss_fn is not None:
+                raw.loss = kd_loss_fn
 
     # ── FIX v4: no world_size arg in this fork ────────────────────────────────
     def _setup_ddp(self):
