@@ -295,15 +295,6 @@ class KDDetectionTrainer(DetectionTrainer):
                 trainer.teacher(batch["img"])
             kd = trainer._compute_kd_loss()
             total = det_loss + trainer._kd_alpha * kd
-            trainer._kd_step += 1
-            if trainer._kd_step % 50 == 0:
-                LOGGER.debug(
-                    colorstr("KD: ") +
-                    f"step={trainer._kd_step}  "
-                    f"det={det_loss.sum().item():.4f}  "
-                    f"kd={kd.item():.5f}  "
-                    f"total={total.item():.4f}"
-                )
             return total, det_items
 
         raw_model.loss = kd_loss_fn
