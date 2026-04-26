@@ -300,7 +300,7 @@ class KDDetectionTrainer(DetectionTrainer):
                 LOGGER.debug(
                     colorstr("KD: ") +
                     f"step={trainer._kd_step}  "
-                    f"det={det_loss.item():.4f}  "
+                    f"det={det_loss.sum().item():.4f}  "
                     f"kd={kd.item():.5f}  "
                     f"total={total.item():.4f}"
                 )
