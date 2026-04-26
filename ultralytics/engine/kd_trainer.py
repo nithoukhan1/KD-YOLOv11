@@ -1,6 +1,6 @@
 """
-kd_trainer.py  —  Final version with all fixes applied
-=======================================================
+kd_trainer.py  —  Final version, all fixes applied
+====================================================
 Place at:  KD-YOLOv11/ultralytics/engine/kd_trainer.py
 
 Teacher : YOLOv11L-C3k2-SC-DySample-ResEMA  (frozen)
@@ -9,18 +9,22 @@ KD Loss : Channel-Wise Distillation (CWD) at ResEMA neck outputs
           YAML layer indices: 14, 18, 22, 26
 
 Fix history:
-    v1 — de_parallel → unwrap_model (fork removed de_parallel)
-    v2 — Pop KD keys from overrides/cfg before super().__init__()
-    v3 — Don't pass cfg=None to super (overrides DEFAULT_CFG)
-    v4 — _setup_ddp() has no world_size arg in this fork
-    v5 — Save KD keys into self.args so DDP subprocess reads them
-    v6 — Override get_validator() to strip KD keys before validator check
-    v7 — Remove debug logger (det_loss is 3-element tensor not scalar)
-    v8 — Cast batch["img"] to teacher dtype (AMP FP16 vs FP32 teacher)
-    v9 — Override save_model() to restore original model.loss before
-         pickling, then re-inject KD loss after saving.
-         Root cause: kd_loss_fn closure contains unpicklable local
-         functions (the forward hook closures), so torch.save crashes.
+    v1  — de_parallel → unwrap_model
+    v2  — Pop KD keys from overrides/cfg before super().__init__()
+    v3  — Don't pass cfg=None to super (overrides DEFAULT_CFG)
+    v4  — _setup_ddp() has no world_size arg in this fork
+    v5  — Save KD keys into self.args so DDP subprocess reads them
+    v6  — Override get_validator() to strip KD keys before validator check
+    v7  — Remove debug logger (det_loss is 3-element tensor not scalar)
+    v8  — Cast batch["img"] to teacher dtype (AMP FP16 vs FP32 teacher)
+    v9  — Override save_model() + _Hook as picklable class
+    v10 — Replace kd_loss_fn closure with _KDLossFn picklable class.
+          The EMA model retains a reference to model.loss, so even after
+          swapping raw_model.loss back to _original_loss the EMA copy
+          still held kd_loss_fn and caused pickle to fail.
+          Making _KDLossFn a top-level class (not a nested closure) makes
+          it fully picklable and eliminates the save_model crash entirely.
+          The save_model override is kept as a belt-and-suspenders safety.
 """
 
 import torch
@@ -32,8 +36,8 @@ from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.utils import LOGGER, colorstr
 from ultralytics.utils.torch_utils import unwrap_model
 
-# KD-specific keys — must never reach Ultralytics cfg validation
-_KD_KEYS = ("teacher_weights", "kd_alpha", "kd_temperature")
+_KD_KEYS   = ("teacher_weights", "kd_alpha", "kd_temperature")
+_KD_LAYERS = [14, 18, 22, 26]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,8 +58,7 @@ class CWDLoss(nn.Module):
     def forward(self, student: torch.Tensor,
                 teacher: torch.Tensor) -> torch.Tensor:
         assert student.shape == teacher.shape, (
-            f"CWD shape mismatch: student {student.shape} "
-            f"vs teacher {teacher.shape}"
+            f"CWD shape mismatch: {student.shape} vs {teacher.shape}"
         )
         B, C, H, W = student.shape
         s = F.softmax(student.view(B, C, -1) / self.T, dim=-1)
@@ -81,14 +84,13 @@ class ChannelAdapter(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Feature Capture (forward hooks)
+# 3.  Hook callable — top-level class so pickle can serialise it
 # ─────────────────────────────────────────────────────────────────────────────
 class _Hook:
     """
-    Picklable hook callable — defined as a top-level callable class instead of
-    a nested closure so that Python's pickle can serialise it if needed.
-    Storing it as a class instance (not a local function) avoids the
-    'Can't get local object ...<locals>.hook' error at torch.save().
+    Picklable forward-hook callable.
+    Defined at module level (not as a nested closure) so torch.save
+    can pickle it without raising AttributeError.
     """
 
     def __init__(self, store: dict, idx: int):
@@ -99,24 +101,21 @@ class _Hook:
         self.store[self.idx] = out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Feature Capture
+# ─────────────────────────────────────────────────────────────────────────────
 class FeatureCapture:
-    """
-    Attaches forward hooks to specific layer indices of a YOLO model
-    and stores their output tensors.
-    """
+    """Attaches picklable forward hooks and stores output tensors."""
 
     def __init__(self, model: nn.Module, layer_indices: list):
         self.features: dict = {}
-        self._hooks: list = []
+        self._hooks: list   = []
         raw = unwrap_model(model)
         for idx in layer_indices:
-            hook_fn = _Hook(self.features, idx)   # picklable callable
-            h = raw.model[idx].register_forward_hook(hook_fn)
+            h = raw.model[idx].register_forward_hook(_Hook(self.features, idx))
             self._hooks.append(h)
-        LOGGER.info(
-            colorstr("KD hooks: ") +
-            f"attached at layers {layer_indices}"
-        )
+        LOGGER.info(colorstr("KD hooks: ") +
+                    f"attached at layers {layer_indices}")
 
     def clear(self):
         self.features.clear()
@@ -128,32 +127,76 @@ class FeatureCapture:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  KD Detection Trainer
+# 5.  KD Loss callable — top-level class so pickle can serialise it
 # ─────────────────────────────────────────────────────────────────────────────
-_KD_LAYERS = [14, 18, 22, 26]   # ResEMA outputs in your neck YAML
+class _KDLossFn:
+    """
+    Picklable replacement for model.loss that adds CWD distillation.
+
+    Defined at module level — NOT as a nested closure inside _inject_kd_loss.
+    This is the critical fix for v10: Python's pickle cannot serialise local
+    functions ('Can't get local object ...kd_loss_fn'), but it CAN serialise
+    instances of top-level classes.
+
+    Holds references to:
+        original_loss — the original DetectionModel.loss bound method
+        trainer       — the KDDetectionTrainer instance
+    Both are picklable.
+    """
+
+    def __init__(self, original_loss, trainer):
+        self.original_loss = original_loss
+        self.trainer       = trainer
+
+    def __call__(self, batch, preds=None):
+        tr = self.trainer
+
+        # 1. Standard detection loss — student forward fires s_hooks
+        det_loss, det_items = self.original_loss(batch, preds)
+
+        # 2. Teacher forward, no grad — t_hooks fire
+        # FIX v8: cast image to teacher dtype (AMP sends FP16, teacher is FP32)
+        with torch.no_grad():
+            teacher_dtype = next(tr.teacher.parameters()).dtype
+            teacher_img   = batch["img"].to(dtype=teacher_dtype)
+            tr.teacher(teacher_img)
+
+        # 3. CWD loss
+        kd = tr._compute_kd_loss()
+
+        # 4. Combine — det_loss is a 3-element tensor (box+cls+dfl)
+        total = det_loss + tr._kd_alpha * kd
+        return total, det_items
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  KD Detection Trainer
+# ─────────────────────────────────────────────────────────────────────────────
 class KDDetectionTrainer(DetectionTrainer):
     """
     Extends DetectionTrainer with CWD Knowledge Distillation.
-    See module docstring for full fix history.
+
+    Extra keys for overrides dict (consumed here, never forwarded):
+        teacher_weights  str    Path to teacher best.pt   (required)
+        kd_alpha         float  KD loss weight             (default 1.0)
+        kd_temperature   float  CWD temperature            (default 4.0)
     """
 
     def __init__(self, cfg=None, overrides=None, _callbacks=None):
 
         # FIX v2: pop KD keys from overrides before cfg validation
-        ov = dict(overrides) if overrides else {}
+        ov    = dict(overrides) if overrides else {}
         tw    = ov.pop("teacher_weights", None)
         alpha = float(ov.pop("kd_alpha", 1.0))
         temp  = float(ov.pop("kd_temperature", 4.0))
 
-        # FIX v2 (DDP path): also pop from cfg dict when it is a dict
+        # FIX v2 DDP path: also pop from cfg dict
         if isinstance(cfg, dict):
             tw    = cfg.pop("teacher_weights", tw)
             alpha = float(cfg.pop("kd_alpha", alpha))
             temp  = float(cfg.pop("kd_temperature", temp))
 
-        # FIX v3: never pass cfg=None explicitly to super
+        # FIX v3: never pass cfg=None explicitly
         if cfg is not None:
             super().__init__(cfg=cfg, overrides=ov, _callbacks=_callbacks)
         else:
@@ -171,7 +214,7 @@ class KDDetectionTrainer(DetectionTrainer):
         self._adapters      = {}
         self._adapters_ok   = False
         self._cwd           = None
-        self._original_loss = None   # kept for save/restore cycle
+        self._original_loss = None
 
     # ── FIX v6: strip KD keys before Validator's cfg check ───────────────────
     def get_validator(self):
@@ -187,28 +230,22 @@ class KDDetectionTrainer(DetectionTrainer):
                 setattr(self.args, key, val)
         return validator
 
-    # ── FIX v9: restore original loss before saving, re-inject after ─────────
+    # ── FIX v9/v10: restore original loss before saving ───────────────────────
     def save_model(self):
         """
-        torch.save() pickles the entire model including model.loss.
-        If model.loss is our kd_loss_fn closure it contains _Hook instances
-        which hold references to dicts — those are picklable — but older
-        versions had local closures that were not.  To be safe we always
-        swap model.loss back to the original bound method before saving,
-        then re-inject KD after the save completes.
+        Belt-and-suspenders: restore model.loss to original before pickling,
+        re-inject after. With _KDLossFn now picklable this may not be strictly
+        needed, but it's kept to avoid any edge-case reference issues.
         """
-        raw = unwrap_model(self.model)
-        kd_loss_fn = None
+        raw        = unwrap_model(self.model)
+        kd_loss_fn = raw.loss if self._original_loss is not None else None
 
-        if self._original_loss is not None:
-            # Temporarily restore the original loss for pickling
-            kd_loss_fn   = raw.loss
-            raw.loss      = self._original_loss
+        if kd_loss_fn is not None:
+            raw.loss = self._original_loss
 
         try:
             super().save_model()
         finally:
-            # Always re-inject KD loss after saving
             if kd_loss_fn is not None:
                 raw.loss = kd_loss_fn
 
@@ -216,15 +253,13 @@ class KDDetectionTrainer(DetectionTrainer):
     def setup_model(self):
         super().setup_model()
 
-        teacher_weights = getattr(self.args, "teacher_weights", None)
-        self._kd_alpha  = float(getattr(self.args, "kd_alpha", 1.0))
-        self._kd_temp   = float(getattr(self.args, "kd_temperature", 4.0))
+        teacher_weights  = getattr(self.args, "teacher_weights", None)
+        self._kd_alpha   = float(getattr(self.args, "kd_alpha",        1.0))
+        self._kd_temp    = float(getattr(self.args, "kd_temperature",  4.0))
 
         if not teacher_weights:
-            LOGGER.warning(
-                colorstr("KD WARNING: ") +
-                "teacher_weights not set — KD loss DISABLED."
-            )
+            LOGGER.warning(colorstr("KD WARNING: ") +
+                           "teacher_weights not set — KD DISABLED.")
             return
 
         self._kd_teacher_weights = teacher_weights
@@ -247,13 +282,11 @@ class KDDetectionTrainer(DetectionTrainer):
         self.teacher.eval()
         self.teacher = self.teacher.to(self.device)
 
-        LOGGER.info(
-            colorstr("KD: ") +
-            f"Teacher frozen on {self.device}.  "
-            f"alpha={self._kd_alpha}  temperature={self._kd_temp}"
-        )
+        LOGGER.info(colorstr("KD: ") +
+                    f"Teacher frozen on {self.device}.  "
+                    f"alpha={self._kd_alpha}  temperature={self._kd_temp}")
 
-    # ── C: Attach forward hooks ───────────────────────────────────────────────
+    # ── C: Attach hooks ───────────────────────────────────────────────────────
     def _attach_hooks(self):
         self._s_hooks = FeatureCapture(self.model,   _KD_LAYERS)
         self._t_hooks = FeatureCapture(self.teacher, _KD_LAYERS)
@@ -267,10 +300,12 @@ class KDDetectionTrainer(DetectionTrainer):
             tc = t_feats[idx].shape[1]
             if sc == tc:
                 self._adapters[idx] = nn.Identity()
-                LOGGER.info(colorstr("KD adapter: ") + f"layer {idx}: {sc} ch — Identity")
+                LOGGER.info(colorstr("KD adapter: ") +
+                            f"layer {idx}: {sc} ch — Identity")
             else:
                 self._adapters[idx] = ChannelAdapter(sc, tc).to(self.device)
-                LOGGER.info(colorstr("KD adapter: ") + f"layer {idx}: {sc}→{tc} — Conv built")
+                LOGGER.info(colorstr("KD adapter: ") +
+                            f"layer {idx}: {sc}→{tc} — Conv built")
         self._adapters_ok = True
 
     # ── E: Compute CWD loss ───────────────────────────────────────────────────
@@ -285,11 +320,9 @@ class KDDetectionTrainer(DetectionTrainer):
                 continue
             s, t = sf[idx], tf[idx]
             if s.shape[-2:] != t.shape[-2:]:
-                s = F.interpolate(
-                    s, size=t.shape[-2:],
-                    mode="bilinear", align_corners=False
-                )
-            # Cast both to float32 — AMP may produce FP16 features
+                s = F.interpolate(s, size=t.shape[-2:],
+                                  mode="bilinear", align_corners=False)
+            # FIX v8: cast to float32 — AMP may produce FP16 features
             s = self._adapters[idx](s.float())
             t = t.float()
             kd = kd + self._cwd(s, t)
@@ -298,33 +331,16 @@ class KDDetectionTrainer(DetectionTrainer):
         self._t_hooks.clear()
         return kd / len(_KD_LAYERS)
 
-    # ── F: Inject KD into model.loss ──────────────────────────────────────────
+    # ── F: Inject KD loss ─────────────────────────────────────────────────────
     def _inject_kd_loss(self):
         raw_model = unwrap_model(self.model)
 
-        # Save the original loss so save_model() can restore it
+        # Save original so save_model() can restore it for pickling
         self._original_loss = raw_model.loss
-        trainer = self
 
-        def kd_loss_fn(batch, preds=None):
-            # 1. Standard detection loss (student forward → s_hooks fire)
-            det_loss, det_items = trainer._original_loss(batch, preds)
+        # FIX v10: use picklable _KDLossFn class, NOT a local closure
+        raw_model.loss = _KDLossFn(self._original_loss, self)
 
-            # 2. Teacher forward, no grad (t_hooks fire)
-            # FIX v8: cast image to teacher dtype (AMP sends FP16, teacher is FP32)
-            with torch.no_grad():
-                teacher_dtype = next(trainer.teacher.parameters()).dtype
-                teacher_img   = batch["img"].to(dtype=teacher_dtype)
-                trainer.teacher(teacher_img)
-
-            # 3. CWD loss
-            kd = trainer._compute_kd_loss()
-
-            # 4. Combine — det_loss is a 3-element tensor (box+cls+dfl)
-            total = det_loss + trainer._kd_alpha * kd
-            return total, det_items
-
-        raw_model.loss = kd_loss_fn
         LOGGER.info(colorstr("KD: ") + "Loss injection complete ✓")
 
     # ── FIX v4: no world_size arg in this fork ────────────────────────────────
@@ -333,7 +349,7 @@ class KDDetectionTrainer(DetectionTrainer):
         if self.teacher is not None:
             self.teacher = self.teacher.to(self.device)
 
-    # ── G: Clean up hooks when training ends ──────────────────────────────────
+    # ── G: Clean up hooks ─────────────────────────────────────────────────────
     def final_eval(self):
         if self._s_hooks:
             self._s_hooks.remove()
@@ -343,7 +359,7 @@ class KDDetectionTrainer(DetectionTrainer):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Public entry-point
+# 7.  Public entry-point
 # ─────────────────────────────────────────────────────────────────────────────
 def train_kd(
     student_yaml:     str,
