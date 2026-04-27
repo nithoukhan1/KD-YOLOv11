@@ -19,14 +19,19 @@ Fix history:
     v8  — Cast batch["img"] to teacher dtype (AMP FP16 vs FP32 teacher)
     v9  — Override save_model() to swap loss before/after pickling
     v10 — _KDLossFn and _Hook as picklable top-level classes
-    v11 — Inject KD loss in _setup_train() AFTER super() creates EMA,
-          not in setup_model(). Root cause: _KDLossFn holds a reference
-          to the trainer, and deepcopy(model) for EMA creation tries to
-          copy the whole trainer including the dataloader iterator, which
-          raises NotImplementedError: _MultiProcessingDataLoaderIter
-          cannot be pickled. Moving injection after EMA is built avoids
-          the EMA ever seeing _KDLossFn, so deepcopy works cleanly.
-          save_model swap is kept as belt-and-suspenders for the EMA save.
+    v11 — Inject KD loss in _setup_train() AFTER EMA is created
+    v12 — Override check_resume() to fix epoch counter on resume:
+          Root cause: self.args.resume is stored as a RELATIVE path
+          (e.g. runs/detect/.../last.pt). The DDP subprocess may have a
+          different working directory so it cannot resolve the relative
+          path, catches the FileNotFoundError silently, and resets
+          start_epoch=0 — causing the epoch counter AND LR schedule to
+          restart from epoch 1.
+          Fix: convert resume path to absolute before calling super, so
+          both main process and DDP subprocess reliably find the checkpoint
+          and correctly restore start_epoch, optimizer state, and LR.
+          Also strips KD keys from checkpoint train_args so get_cfg does
+          not reject them with SyntaxError.
 """
 
 import torch
@@ -86,13 +91,10 @@ class ChannelAdapter(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Hook callable — top-level picklable class
+# 3.  Hook callable — picklable top-level class
 # ─────────────────────────────────────────────────────────────────────────────
 class _Hook:
-    """
-    Picklable forward-hook callable.
-    Module-level class (not a nested closure) so torch.save can pickle it.
-    """
+    """Picklable forward-hook. Module-level so torch.save can serialise it."""
 
     def __init__(self, store: dict, idx: int):
         self.store = store
@@ -130,18 +132,13 @@ class FeatureCapture:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  KD Loss callable — top-level picklable class
+# 5.  KD Loss callable — picklable top-level class
 # ─────────────────────────────────────────────────────────────────────────────
 class _KDLossFn:
     """
     Picklable replacement for model.loss that adds CWD distillation.
-    Module-level class — NOT a nested closure — so Python's pickle can
-    serialise it. Holds original_loss and trainer as instance attributes.
-
-    IMPORTANT: This is only assigned to model.loss AFTER EMA is created
-    (inside _setup_train, after super()._setup_train()). This prevents
-    deepcopy(model) during EMA creation from trying to copy the trainer
-    and its unpicklable dataloader iterator.
+    Module-level class (not a closure) so torch.save can serialise it.
+    Injected AFTER EMA creation to avoid deepcopy of dataloader iterator.
     """
 
     def __init__(self, original_loss, trainer):
@@ -151,20 +148,20 @@ class _KDLossFn:
     def __call__(self, batch, preds=None):
         tr = self.trainer
 
-        # 1. Standard detection loss (student forward → s_hooks fire)
+        # 1. Standard detection loss — student forward fires s_hooks
         det_loss, det_items = self.original_loss(batch, preds)
 
-        # 2. Teacher forward, no grad (t_hooks fire)
-        # FIX v8: cast image to teacher dtype — AMP sends FP16, teacher is FP32
+        # 2. Teacher forward, no grad — t_hooks fire
+        # FIX v8: cast to teacher dtype — AMP sends FP16, teacher is FP32
         with torch.no_grad():
             teacher_dtype = next(tr.teacher.parameters()).dtype
             teacher_img   = batch["img"].to(dtype=teacher_dtype)
             tr.teacher(teacher_img)
 
-        # 3. CWD loss
+        # 3. CWD
         kd = tr._compute_kd_loss()
 
-        # 4. Combine — det_loss is a 3-element tensor (box+cls+dfl)
+        # 4. Combine — det_loss is 3-element tensor (box+cls+dfl)
         total = det_loss + tr._kd_alpha * kd
         return total, det_items
 
@@ -175,14 +172,6 @@ class _KDLossFn:
 class KDDetectionTrainer(DetectionTrainer):
     """
     Extends DetectionTrainer with CWD Knowledge Distillation.
-
-    Key design — injection order:
-        setup_model()   → loads student + teacher, attaches hooks, builds CWD
-                          does NOT inject kd_loss_fn yet
-        _setup_train()  → calls super() which builds EMA from model with
-                          ORIGINAL loss (so deepcopy works cleanly)
-                          THEN injects _KDLossFn into model.loss
-                          From this point forward every forward pass uses KD
 
     Extra overrides keys (consumed here, never forwarded):
         teacher_weights  str    Path to teacher best.pt   (required)
@@ -223,7 +212,114 @@ class KDDetectionTrainer(DetectionTrainer):
         self._adapters_ok   = False
         self._cwd           = None
         self._original_loss = None
-        self._kd_ready      = False   # True after _setup_train injects KD
+        self._kd_ready      = False
+
+    # ── FIX v12: correct epoch counter on resume ──────────────────────────────
+    def check_resume(self, overrides):
+        """
+        Two problems fixed here:
+
+        1. RELATIVE PATH BUG (epoch counter resets):
+           self.args.resume is stored as a relative path like
+           'runs/detect/.../last.pt'. The DDP subprocess may have a
+           different CWD and cannot resolve the relative path. It catches
+           the failure silently and resets start_epoch=0, causing the
+           epoch counter and LR schedule to restart from epoch 1.
+           Fix: resolve the resume path to absolute before calling super.
+
+        2. KD KEYS IN CHECKPOINT:
+           When a checkpoint was saved by our trainer, self.args contained
+           KD keys. These get persisted in checkpoint train_args. When
+           check_resume calls get_cfg(ckpt_args), Ultralytics rejects the
+           unknown keys with SyntaxError. We strip them first.
+        """
+        resume = getattr(self.args, "resume", None)
+
+        if not resume or resume is True:
+            # No resume path — nothing to fix
+            super().check_resume(overrides)
+            return
+
+        # ── FIX 1: make path absolute ─────────────────────────────────────────
+        resume_path = Path(str(resume))
+        if not resume_path.is_absolute():
+            # Try resolving against CWD
+            abs_path = Path.cwd() / resume_path
+            if abs_path.exists():
+                self.args.resume = str(abs_path)
+                LOGGER.info(
+                    colorstr("KD resume: ") +
+                    f"Resolved relative path to absolute: {abs_path}"
+                )
+            else:
+                # Try common Kaggle working dir patterns
+                for base in [
+                    Path("/kaggle/working/KD-YOLOv11"),
+                    Path("/kaggle/working"),
+                ]:
+                    candidate = base / resume_path
+                    if candidate.exists():
+                        self.args.resume = str(candidate)
+                        LOGGER.info(
+                            colorstr("KD resume: ") +
+                            f"Found checkpoint at: {candidate}"
+                        )
+                        break
+
+        # ── FIX 2: strip KD keys from checkpoint train_args ──────────────────
+        # Load checkpoint raw dict, strip our custom keys, save to temp file,
+        # let super()'s check_resume load the clean version.
+        resolved = Path(str(self.args.resume))
+
+        if resolved.exists():
+            try:
+                import tempfile, os
+                ckpt = torch.load(
+                    str(resolved), map_location="cpu", weights_only=False
+                )
+                train_args = ckpt.get("train_args", {})
+                kd_vals    = {k: train_args.pop(k, None) for k in _KD_KEYS}
+                ckpt["train_args"] = train_args
+
+                # Write clean checkpoint to temp file
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".pt", delete=False,
+                    dir=str(resolved.parent)
+                )
+                tmp.close()
+                torch.save(ckpt, tmp.name)
+
+                # Point resume at the clean temp file
+                original_resume  = self.args.resume
+                self.args.resume = tmp.name
+
+                try:
+                    super().check_resume(overrides)
+                finally:
+                    os.unlink(tmp.name)
+                    # Restore original absolute path so DDP subprocess gets it
+                    if hasattr(self.args, "resume"):
+                        self.args.resume = str(resolved)
+
+                # Restore KD values that were in the checkpoint
+                for k, v in kd_vals.items():
+                    if v is not None and not getattr(self.args, k, None):
+                        setattr(self.args, k, v)
+
+                LOGGER.info(
+                    colorstr("KD resume: ") +
+                    f"Checkpoint loaded cleanly. Epoch will resume correctly."
+                )
+                return
+
+            except Exception as e:
+                LOGGER.warning(
+                    colorstr("KD resume WARNING: ") +
+                    f"Clean-load attempt failed ({e}), falling back to super."
+                )
+
+        # Fallback — let super handle it as-is
+        super().check_resume(overrides)
 
     # ── FIX v6: strip KD keys before Validator cfg check ─────────────────────
     def get_validator(self):
@@ -239,10 +335,22 @@ class KDDetectionTrainer(DetectionTrainer):
                 setattr(self.args, key, val)
         return validator
 
-    # ── A: Build student and load teacher, attach hooks, build CWD ───────────
+    # ── FIX v9: restore original loss before save, re-inject after ────────────
+    def save_model(self):
+        raw        = unwrap_model(self.model)
+        kd_loss_fn = raw.loss if self._original_loss is not None else None
+        if kd_loss_fn is not None:
+            raw.loss = self._original_loss
+        try:
+            super().save_model()
+        finally:
+            if kd_loss_fn is not None:
+                raw.loss = kd_loss_fn
+
+    # ── A: Build student and load teacher ─────────────────────────────────────
     #       Does NOT inject model.loss — that happens after EMA is created.
     def setup_model(self):
-        super().setup_model()   # builds self.model (student)
+        super().setup_model()
 
         teacher_weights  = getattr(self.args, "teacher_weights", None)
         self._kd_alpha   = float(getattr(self.args, "kd_alpha",       1.0))
@@ -257,18 +365,10 @@ class KDDetectionTrainer(DetectionTrainer):
         self._load_teacher()
         self._attach_hooks()
         self._cwd = CWDLoss(temperature=self._kd_temp)
-        # NOTE: _inject_kd_loss() is called from _setup_train(), not here.
 
-    # ── FIX v11: _setup_train injects KD AFTER EMA is created ────────────────
+    # ── FIX v11: inject KD AFTER EMA is created ───────────────────────────────
     def _setup_train(self):
-        """
-        super()._setup_train() creates the EMA via deepcopy(model).
-        At that point model.loss is still the original — deepcopy works.
-        We inject _KDLossFn immediately after, so all training steps use KD.
-        """
         super()._setup_train()
-
-        # Only inject if teacher was successfully loaded
         if self.teacher is not None and not self._kd_ready:
             self._inject_kd_loss()
             self._kd_ready = True
@@ -327,7 +427,6 @@ class KDDetectionTrainer(DetectionTrainer):
             if s.shape[-2:] != t.shape[-2:]:
                 s = F.interpolate(s, size=t.shape[-2:],
                                   mode="bilinear", align_corners=False)
-            # FIX v8: cast to float32 — AMP may give FP16 features
             s = self._adapters[idx](s.float())
             t = t.float()
             kd = kd + self._cwd(s, t)
@@ -336,26 +435,12 @@ class KDDetectionTrainer(DetectionTrainer):
         self._t_hooks.clear()
         return kd / len(_KD_LAYERS)
 
-    # ── F: Inject KD loss (called from _setup_train after EMA is built) ───────
+    # ── F: Inject KD loss ─────────────────────────────────────────────────────
     def _inject_kd_loss(self):
-        raw_model = unwrap_model(self.model)
+        raw_model           = unwrap_model(self.model)
         self._original_loss = raw_model.loss
-        # FIX v10: picklable class, not a local closure
-        raw_model.loss = _KDLossFn(self._original_loss, self)
+        raw_model.loss      = _KDLossFn(self._original_loss, self)
         LOGGER.info(colorstr("KD: ") + "Loss injection complete ✓")
-
-    # ── FIX v9: restore original loss before save, re-inject after ────────────
-    def save_model(self):
-        raw        = unwrap_model(self.model)
-        kd_loss_fn = raw.loss if self._original_loss is not None else None
-
-        if kd_loss_fn is not None:
-            raw.loss = self._original_loss
-        try:
-            super().save_model()
-        finally:
-            if kd_loss_fn is not None:
-                raw.loss = kd_loss_fn
 
     # ── FIX v4: no world_size arg in this fork ────────────────────────────────
     def _setup_ddp(self):
@@ -392,6 +477,10 @@ def train_kd(
     """
     Launch KD training from a Kaggle notebook.
     batch=16 not 32 — teacher + student share GPU VRAM each forward pass.
+
+    For resume:
+        Pass the path to last.pt as student_yaml and set resume=True.
+        The epoch counter will correctly continue from the saved epoch.
     """
     overrides = dict(
         model        = student_yaml,
