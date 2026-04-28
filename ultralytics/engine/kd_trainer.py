@@ -297,9 +297,14 @@ class KDDetectionTrainer(DetectionTrainer):
                     super().check_resume(overrides)
                 finally:
                     os.unlink(tmp.name)
-                    # Restore original absolute path so DDP subprocess gets it
+                    # Restore BOTH resume and model to absolute path
+                    # super().check_resume sets self.args.model to the temp
+                    # file path — DDP subprocess then fails when it tries
+                    # to load the already-deleted temp file.
                     if hasattr(self.args, "resume"):
                         self.args.resume = str(resolved)
+                    if hasattr(self.args, "model"):
+                        self.args.model = str(resolved)
 
                 # Restore KD values that were in the checkpoint
                 for k, v in kd_vals.items():
