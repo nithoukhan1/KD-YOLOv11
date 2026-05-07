@@ -487,6 +487,16 @@ def train_kd(
         Pass the path to last.pt as student_yaml and set resume=True.
         The epoch counter will correctly continue from the saved epoch.
     """
+    # When resume=True and student_yaml is a checkpoint (.pt file),
+    # convert resume to the actual path string so check_resume can
+    # resolve it to absolute, strip KD keys, and correctly restore
+    # start_epoch + optimizer state. resume=True (boolean) causes
+    # Ultralytics to call get_latest_run() which then hits KD keys
+    # in train_args and silently resets start_epoch=0.
+    resume_val = resume
+    if resume is True and str(student_yaml).endswith(".pt"):
+        resume_val = str(student_yaml)
+
     overrides = dict(
         model        = student_yaml,
         data         = data_yaml,
@@ -503,7 +513,7 @@ def train_kd(
         patience     = 75,
         project      = project,
         name         = name,
-        resume       = resume,
+        resume       = resume_val,   # ← path string, not boolean True
         teacher_weights = teacher_weights,
         kd_alpha        = kd_alpha,
         kd_temperature  = kd_temperature,
