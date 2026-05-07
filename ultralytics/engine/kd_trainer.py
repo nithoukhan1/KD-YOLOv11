@@ -354,8 +354,11 @@ class KDDetectionTrainer(DetectionTrainer):
 
     # ── A: Build student and load teacher ─────────────────────────────────────
     #       Does NOT inject model.loss — that happens after EMA is created.
-    def setup_model(self):
-        super().setup_model()
+def setup_model(self):
+        # Capture ckpt from super — _setup_train needs it to restore
+        # start_epoch and optimizer state on resume. Without returning
+        # it, _setup_train sees ckpt=None and resets start_epoch=0.
+        ckpt = super().setup_model()
 
         teacher_weights  = getattr(self.args, "teacher_weights", None)
         self._kd_alpha   = float(getattr(self.args, "kd_alpha",       1.0))
@@ -364,12 +367,14 @@ class KDDetectionTrainer(DetectionTrainer):
         if not teacher_weights:
             LOGGER.warning(colorstr("KD WARNING: ") +
                            "teacher_weights not set — KD DISABLED.")
-            return
+            return ckpt
 
         self._kd_teacher_weights = teacher_weights
         self._load_teacher()
         self._attach_hooks()
         self._cwd = CWDLoss(temperature=self._kd_temp)
+
+        return ckpt   # ← _setup_train uses this to restore start_epoch + optimizer
 
     # ── FIX v11: inject KD AFTER EMA is created ───────────────────────────────
     def _setup_train(self):
