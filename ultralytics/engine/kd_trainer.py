@@ -354,7 +354,7 @@ class KDDetectionTrainer(DetectionTrainer):
 
     # ── A: Build student and load teacher ─────────────────────────────────────
     #       Does NOT inject model.loss — that happens after EMA is created.
-def setup_model(self):
+    def setup_model(self):
         # Capture ckpt from super — _setup_train needs it to restore
         # start_epoch and optimizer state on resume. Without returning
         # it, _setup_train sees ckpt=None and resets start_epoch=0.
